@@ -104,3 +104,30 @@ def reference_reconcile(sp_children, sp_root, g_children, g_root, leaf_map):
 
     total = sum(edge_loss.values())
     return mapping, events, edge_loss, edge_sibs, total
+
+
+def reference_check_transfer(sp_children, sp_root, donor, recipient):
+    """横向转移检查的独立参考：返回 (feasible, interval, reason_code)。
+
+    与核心实现相互独立：祖先关系用“祖先集合包含”判定，深度由祖先链
+    长度直接数出，区间相交按朴素 max/min 计算。
+    """
+    sp = RefTree(sp_children, sp_root)
+    if donor == sp.root or recipient == sp.root:
+        return (False, None, "root_branch")
+    if donor == recipient:
+        return (False, None, "same_branch")
+    anc_donor = sp.ancestors(donor)       # 含 donor 自身
+    anc_recip = sp.ancestors(recipient)   # 含 recipient 自身
+    if donor in anc_recip or recipient in anc_donor:
+        return (False, None, "ancestor_related")
+
+    def depth(n):
+        return len(sp.ancestors(n)) - 1
+
+    d_lo, d_hi = depth(sp.parent[donor]), depth(donor)
+    r_lo, r_hi = depth(sp.parent[recipient]), depth(recipient)
+    t0, t1 = max(d_lo, r_lo), min(d_hi, r_hi)
+    if t0 > t1:
+        return (False, None, "no_time_overlap")
+    return (True, (t0, t1), None)

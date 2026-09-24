@@ -13,15 +13,20 @@ import math
 import unittest
 from itertools import product
 
-from reference import reference_reconcile
+from reference import reference_check_transfer, reference_reconcile
 
 from reconciliation import (
     DUPLICATION,
     SPECIATION,
+    TRANSFER_ANCESTOR_RELATED,
+    TRANSFER_NO_TIME_OVERLAP,
+    TRANSFER_ROOT_BRANCH,
+    TRANSFER_SAME_BRANCH,
     InvalidInputError,
     LeafMappingError,
     TreeStructureError,
     build_tree,
+    check_transfer,
     reconcile,
 )
 
@@ -481,6 +486,190 @@ class EventPathReplayTests(unittest.TestCase):
             )
             self.assertEqual(edge.loss_count, expect_losses)
             self.assertEqual(edge.loss_count, len(edge.lost_lineages))
+
+
+class TransferHandCheckedTests(unittest.TestCase):
+    """候选横向转移检查：手工可复验算例，期望值硬编码。
+
+    物种树 SP：r:(x,D)，x:(y,C)，y:(A,B)。
+    深度：r=0；x=1, D=1；y=2, C=2；A=3, B=3。
+    分支时间区间 = [depth(父), depth(节点)]（闭区间）。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.sp = build_tree(SP, "r", name="species")
+
+    def test_feasible_full_overlap_between_siblings(self):
+        # A、B 为姐妹分支，区间同为 [2,3]，完全重叠。
+        chk = check_transfer(self.sp, "A", "B")
+        self.assertTrue(chk.feasible)
+        self.assertEqual(chk.interval, (2, 3))
+        self.assertIsNone(chk.reason)
+        self.assertIsNone(chk.reason_code)
+
+    def test_feasible_partial_overlap(self):
+        # 更深的树：p:(u,v)，u:(A,w)，w:(B,C)，v:(D,E)。
+        # 深度：p=0；u=1, v=1；A=2, w=2, D=2, E=2；B=3, C=3。
+        sp = build_tree(
+            {"p": ("u", "v"), "u": ("A", "w"), "w": ("B", "C"), "v": ("D", "E")},
+            "p",
+        )
+        # 供体 w 区间 [1,2]，受体 D 区间 [1,2] -> 完全重叠 (1,2)。
+        chk = check_transfer(sp, "w", "D")
+        self.assertTrue(chk.feasible)
+        self.assertEqual(chk.interval, (1, 2))
+        # 供体 B 区间 [2,3]，受体 A 区间 [1,2] -> 仅端点 t=2 相触。
+        chk2 = check_transfer(sp, "B", "A")
+        self.assertTrue(chk2.feasible)
+        self.assertEqual(chk2.interval, (2, 2))
+
+    def test_endpoint_touch_is_feasible(self):
+        # C 区间 [1,2]，B 区间 [2,3]：仅在端点 t=2 相触，闭区间视为相交。
+        chk = check_transfer(self.sp, "C", "B")
+        self.assertTrue(chk.feasible)
+        self.assertEqual(chk.interval, (2, 2))
+        # 方向对调结论相同（区间相交对称）。
+        chk_rev = check_transfer(self.sp, "B", "C")
+        self.assertTrue(chk_rev.feasible)
+        self.assertEqual(chk_rev.interval, (2, 2))
+        # D 区间 [0,1]，C 区间 [1,2]：端点 t=1 相触。
+        chk2 = check_transfer(self.sp, "D", "C")
+        self.assertTrue(chk2.feasible)
+        self.assertEqual(chk2.interval, (1, 1))
+
+    def test_ancestor_relation_rejected_both_directions(self):
+        # y 是 A 的祖先（供体为祖先）。
+        chk = check_transfer(self.sp, "y", "A")
+        self.assertFalse(chk.feasible)
+        self.assertIsNone(chk.interval)
+        self.assertEqual(chk.reason_code, TRANSFER_ANCESTOR_RELATED)
+        self.assertIn("祖先", chk.reason)
+        # 受体为祖先（方向对调同样拒绝）。
+        chk2 = check_transfer(self.sp, "A", "y")
+        self.assertFalse(chk2.feasible)
+        self.assertEqual(chk2.reason_code, TRANSFER_ANCESTOR_RELATED)
+        # 供体是受体的直接父分支（x -> y）也属于祖先关系。
+        chk3 = check_transfer(self.sp, "x", "y")
+        self.assertFalse(chk3.feasible)
+        self.assertEqual(chk3.reason_code, TRANSFER_ANCESTOR_RELATED)
+
+    def test_ancestor_check_precedes_time_overlap(self):
+        # x 是 A 的祖先，且区间 [0,1] 与 [2,3] 本就不相交；
+        # 固定检查顺序下应报祖先关系而非时间不相交。
+        chk = check_transfer(self.sp, "x", "A")
+        self.assertFalse(chk.feasible)
+        self.assertEqual(chk.reason_code, TRANSFER_ANCESTOR_RELATED)
+
+    def test_no_time_overlap_rejected(self):
+        # D 区间 [0,1]，A 区间 [2,3]：互无祖先关系但时间不相交。
+        chk = check_transfer(self.sp, "D", "A")
+        self.assertFalse(chk.feasible)
+        self.assertIsNone(chk.interval)
+        self.assertEqual(chk.reason_code, TRANSFER_NO_TIME_OVERLAP)
+        self.assertIn("不相交", chk.reason)
+
+    def test_root_branch_rejected(self):
+        for donor, recipient in [("r", "A"), ("A", "r"), ("r", "r")]:
+            chk = check_transfer(self.sp, donor, recipient)
+            self.assertFalse(chk.feasible, (donor, recipient))
+            self.assertEqual(chk.reason_code, TRANSFER_ROOT_BRANCH)
+            self.assertIsNone(chk.interval)
+
+    def test_same_branch_rejected(self):
+        chk = check_transfer(self.sp, "A", "A")
+        self.assertFalse(chk.feasible)
+        self.assertEqual(chk.reason_code, TRANSFER_SAME_BRANCH)
+        # 同一内节点分支也一样。
+        chk2 = check_transfer(self.sp, "y", "y")
+        self.assertEqual(chk2.reason_code, TRANSFER_SAME_BRANCH)
+
+    def test_result_is_pure_and_repeatable(self):
+        a = check_transfer(self.sp, "C", "B")
+        b = check_transfer(self.sp, "C", "B")
+        self.assertEqual(a, b)
+        # 对合法与非法各取一次，不影响后续复演结果。
+        res1 = reconcile(
+            self.sp,
+            build_tree({"g1": ("a1", "b1"), "gr": ("g1", "c1")}, "gr"),
+            {"a1": "A", "b1": "B", "c1": "C"},
+        )
+        check_transfer(self.sp, "D", "A")
+        res2 = reconcile(
+            self.sp,
+            build_tree({"g1": ("a1", "b1"), "gr": ("g1", "c1")}, "gr"),
+            {"a1": "A", "b1": "B", "c1": "C"},
+        )
+        self.assertEqual(res1, res2)
+
+
+class TransferInputErrorTests(unittest.TestCase):
+    """输入本身不合法（非候选不可行）时必须抛 InvalidInputError。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.sp = build_tree(SP, "r", name="species")
+
+    def test_non_tree_rejected(self):
+        with self.assertRaises(InvalidInputError):
+            check_transfer("not a tree", "A", "B")
+        with self.assertRaises(InvalidInputError):
+            check_transfer(None, "A", "B")
+
+    def test_unknown_node_rejected(self):
+        with self.assertRaises(InvalidInputError):
+            check_transfer(self.sp, "ZZZ", "A")
+        with self.assertRaises(InvalidInputError):
+            check_transfer(self.sp, "A", "ZZZ")
+
+    def test_bad_label_types(self):
+        for bad in (3, None, "", True, 1.5):
+            with self.assertRaises(InvalidInputError):
+                check_transfer(self.sp, bad, "A")
+            with self.assertRaises(InvalidInputError):
+                check_transfer(self.sp, "A", bad)
+
+
+class TransferCrossCheckTests(unittest.TestCase):
+    """与独立参考的穷举交叉核对：3/4 叶物种树全部形状 × 全部有序节点对。"""
+
+    def _run_family(self, sp_leaves):
+        k = len(sp_leaves)
+        checked = 0
+        for sp_shape in all_shapes(0, k):
+            sp_ch, sp_root = to_children(sp_shape, "s")
+            sp_ch = {
+                p: tuple(
+                    sp_leaves[int(c[4:])] if c.startswith("leaf") else c
+                    for c in pair
+                )
+                for p, pair in sp_ch.items()
+            }
+            sp_tree = build_tree(sp_ch, sp_root, name="species")
+            nodes = sorted(sp_tree.nodes)
+            for donor in nodes:
+                for recipient in nodes:
+                    chk = check_transfer(sp_tree, donor, recipient)
+                    ref = reference_check_transfer(sp_ch, sp_root, donor, recipient)
+                    self.assertEqual(
+                        (chk.feasible, chk.interval, chk.reason_code),
+                        ref,
+                        (sp_leaves, sp_shape, donor, recipient),
+                    )
+                    # 聚合自洽（补充）：可行 <=> 有区间且无原因码。
+                    self.assertEqual(chk.feasible, chk.interval is not None)
+                    self.assertEqual(chk.feasible, chk.reason_code is None)
+                    self.assertEqual(chk.feasible, chk.reason is None)
+                    checked += 1
+        return checked
+
+    def test_species_3_leaves_all_pairs(self):
+        n = self._run_family(("A", "B", "C"))
+        self.assertGreater(n, 40)  # 2 形状 × 5 节点² = 50
+
+    def test_species_4_leaves_all_pairs(self):
+        n = self._run_family(("A", "B", "C", "D"))
+        self.assertGreater(n, 200)  # 5 形状 × 7 节点² = 245
 
 
 if __name__ == "__main__":

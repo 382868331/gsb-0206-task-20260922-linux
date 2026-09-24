@@ -4,7 +4,8 @@
 
 - build_tree(children, root=None, *, name=..., max_nodes=200) -> Tree
 - reconcile(species_tree, gene_tree, leaf_mapping, *, max_nodes=200) -> ReconciliationResult
-- 数据类型: Tree / Event / LostLineage / EdgeLoss / ReconciliationResult
+- check_transfer(species_tree, donor, recipient) -> TransferCheck
+- 数据类型: Tree / Event / LostLineage / EdgeLoss / ReconciliationResult / TransferCheck
 - 错误类型:
     ReconciliationError
       ├─ InvalidInputError     # 类型/取值非法（含 bool 充整数、NaN/Infinity、超节点上限）
@@ -37,18 +38,30 @@ __all__ = [
     "LostLineage",
     "EdgeLoss",
     "ReconciliationResult",
+    "TransferCheck",
     "build_tree",
     "reconcile",
+    "check_transfer",
     "ReconciliationError",
     "InvalidInputError",
     "TreeStructureError",
     "LeafMappingError",
     "SPECIATION",
     "DUPLICATION",
+    "TRANSFER_ROOT_BRANCH",
+    "TRANSFER_SAME_BRANCH",
+    "TRANSFER_ANCESTOR_RELATED",
+    "TRANSFER_NO_TIME_OVERLAP",
 ]
 
 SPECIATION = "speciation"
 DUPLICATION = "duplication"
+
+# check_transfer 的拒绝原因码（TransferCheck.reason_code 的取值）。
+TRANSFER_ROOT_BRANCH = "root_branch"            # 供体或受体为根节点，无对应分支
+TRANSFER_SAME_BRANCH = "same_branch"            # 供受双方是同一分支
+TRANSFER_ANCESTOR_RELATED = "ancestor_related"  # 供受分支互有祖先-后裔关系
+TRANSFER_NO_TIME_OVERLAP = "no_time_overlap"    # 供受分支时间区间不相交
 
 # 题面给定的接口边界（单棵树节点数）。
 DEFAULT_MAX_NODES = 200
@@ -619,4 +632,148 @@ def reconcile(
         duplications=duplications,
         speciations=speciations,
         total_losses=total_losses,
+    )
+
+
+@dataclass(frozen=True)
+class TransferCheck:
+    """候选横向转移（HGT）的合法性结论。
+
+    Attributes:
+        donor: 供体分支（以其下端物种节点标识）。
+        recipient: 受体分支（同上的标识方式）。
+        feasible: 转移是否合法。
+        interval: 合法时的可行转移时间区间 ``(t0, t1)``（闭区间，含端点；
+            端点相触也算相交，此时 ``t0 == t1``）；非法时为 ``None``。
+        reason: 非法时的人类可读拒绝原因；合法时为 ``None``。
+        reason_code: 机器可读原因码，取值为 ``TRANSFER_ROOT_BRANCH`` /
+            ``TRANSFER_SAME_BRANCH`` / ``TRANSFER_ANCESTOR_RELATED`` /
+            ``TRANSFER_NO_TIME_OVERLAP`` 之一；合法时为 ``None``。
+    """
+
+    donor: str
+    recipient: str
+    feasible: bool
+    interval: tuple[int, int] | None
+    reason: str | None
+    reason_code: str | None
+
+
+def _is_ancestor_or_same(tree: Tree, a: str, b: str) -> bool:
+    """a 是否为 b 的祖先（含 a == b）；沿父链爬升，深度差步内结束。"""
+    node = b
+    while True:
+        if node == a:
+            return True
+        parent = tree.parent.get(node)
+        if parent is None:
+            return False
+        node = parent
+
+
+def _reject_transfer(donor: str, recipient: str, code: str, reason: str) -> TransferCheck:
+    return TransferCheck(
+        donor=donor,
+        recipient=recipient,
+        feasible=False,
+        interval=None,
+        reason=reason,
+        reason_code=code,
+    )
+
+
+def check_transfer(species_tree: Tree, donor: str, recipient: str) -> TransferCheck:
+    """检查一对候选供/受体分支之间的横向转移是否合法。
+
+    在既有复演结果（叶映射固定、不重新优化）之上，仅就**物种树**分支做
+    拓扑与时间检查，不改动任何已有结果：
+
+    - 时间模型：节点时间 = 其在物种树中的深度（根为 0，单位为分支层数）；
+      非根节点 ``n`` 的分支占据闭区间 ``[depth(parent(n)), depth(n)]``。
+    - 合法条件：供受分支时间区间**相交**（闭区间，端点相触也算相交，
+      此时可行区间退化为单个时间点），且两分支**互无祖先-后裔关系**。
+    - 合法时返回 ``TransferCheck(feasible=True, interval=(t0, t1))``；
+      非法时返回 ``feasible=False`` 并给出 ``reason`` / ``reason_code``，
+      不抛异常（候选本身结构合法、只是生物学上不可行）。
+
+    检查顺序固定：根分支 -> 同一分支 -> 祖先关系 -> 时间相交；
+    前置条件不满足时不再检查后续条件。
+
+    Args:
+        species_tree: ``build_tree`` 构造的物种树（应与复演所用为同一棵）。
+        donor: 供体分支的下端节点标签（物种树中的非根节点）。
+        recipient: 受体分支的下端节点标签。
+
+    Returns:
+        TransferCheck：可行区间或拒绝原因。
+
+    Raises:
+        InvalidInputError: ``species_tree`` 不是本库 ``Tree``，或供/受体
+            标签类型非法、不在物种树中（输入本身不合法，而非候选不可行）。
+    """
+    if not isinstance(species_tree, Tree):
+        raise InvalidInputError(
+            f"species_tree 必须为 build_tree 产出的 Tree，实际为 {type(species_tree).__name__}"
+        )
+    donor = _require_label(donor, "供体 donor")
+    recipient = _require_label(recipient, "受体 recipient")
+    for label, who in ((donor, "供体"), (recipient, "受体")):
+        if label not in species_tree.nodes:
+            raise InvalidInputError(
+                f"{who}节点 {label!r} 不在物种树 {species_tree.name!r} 中"
+            )
+
+    root = species_tree.root
+    if donor == root or recipient == root:
+        who = "供体" if donor == root else "受体"
+        return _reject_transfer(
+            donor,
+            recipient,
+            TRANSFER_ROOT_BRANCH,
+            f"{who}为根节点 {root!r}，根上方没有分支，不能作为转移端点",
+        )
+    if donor == recipient:
+        return _reject_transfer(
+            donor,
+            recipient,
+            TRANSFER_SAME_BRANCH,
+            f"供体与受体是同一分支（{donor!r}），横向转移要求两个不同分支",
+        )
+    if _is_ancestor_or_same(species_tree, donor, recipient):
+        return _reject_transfer(
+            donor,
+            recipient,
+            TRANSFER_ANCESTOR_RELATED,
+            f"供体分支 {donor!r} 是受体分支 {recipient!r} 的祖先，"
+            "二者为直系传代关系，不是横向转移",
+        )
+    if _is_ancestor_or_same(species_tree, recipient, donor):
+        return _reject_transfer(
+            donor,
+            recipient,
+            TRANSFER_ANCESTOR_RELATED,
+            f"受体分支 {recipient!r} 是供体分支 {donor!r} 的祖先，"
+            "二者为直系传代关系，不是横向转移",
+        )
+
+    depth = species_tree.depth
+    parent = species_tree.parent
+    d_lo, d_hi = depth[parent[donor]], depth[donor]
+    r_lo, r_hi = depth[parent[recipient]], depth[recipient]
+    t0, t1 = max(d_lo, r_lo), min(d_hi, r_hi)
+    if t0 > t1:
+        return _reject_transfer(
+            donor,
+            recipient,
+            TRANSFER_NO_TIME_OVERLAP,
+            f"供体分支时间区间 [{d_lo}, {d_hi}] 与受体 [{r_lo}, {r_hi}] 不相交，"
+            "两分支不曾同时存在",
+        )
+    return TransferCheck(
+        donor=donor,
+        recipient=recipient,
+        feasible=True,
+        interval=(t0, t1),
+        reason=None,
+        reason_code=None,
     )

@@ -9,9 +9,11 @@ from __future__ import annotations
 from reconciliation import (
     DUPLICATION,
     SPECIATION,
+    InvalidInputError,
     LeafMappingError,
     TreeStructureError,
     build_tree,
+    check_transfer,
     reconcile,
 )
 
@@ -129,6 +131,38 @@ def main():
     except TreeStructureError as exc:
         print(f"    循环树被拒绝：{type(exc).__name__}: {exc}")
         print(f"    （定位字段 tree={exc.tree!r}, node={exc.node!r}）")
+
+    print("=" * 72)
+    print("部分三：候选横向转移（HGT）合法性检查（叶映射固定，只查物种树分支）")
+    print("=" * 72)
+    print("    时间模型：节点时间 = 深度（根 r 为 0）；分支区间 = [depth(父), depth(节点)]")
+    print("    深度：r=0；x=1, D=1；y=2, C=2；A=3, B=3")
+    print()
+
+    def show_transfer(donor, recipient):
+        chk = check_transfer(sp, donor, recipient)
+        if chk.feasible:
+            t0, t1 = chk.interval
+            print(f"    {donor} -> {recipient}: 合法，可行转移时间区间 [{t0}, {t1}]")
+        else:
+            print(f"    {donor} -> {recipient}: 拒绝（{chk.reason_code}）{chk.reason}")
+
+    # 正常：姐妹分支 A([2,3]) 与 B([2,3]) 完全重叠。
+    show_transfer("A", "B")
+    # 边界：C([1,2]) 与 B([2,3]) 仅在端点 t=2 相触 —— 闭区间视为相交。
+    show_transfer("C", "B")
+    # 拒绝：y 是 A 的祖先（直系传代，不是横向转移）。
+    show_transfer("y", "A")
+    # 拒绝：D([0,1]) 与 A([2,3]) 时间区间不相交。
+    show_transfer("D", "A")
+    # 拒绝：根节点上方没有分支。
+    show_transfer("r", "A")
+
+    # 实际错误：供体标签不在物种树中 —— 输入不合法，抛异常而非返回拒绝。
+    try:
+        check_transfer(sp, "ZZZ", "A")
+    except InvalidInputError as exc:
+        print(f"    未知供体被拒绝：{type(exc).__name__}: {exc}")
 
     print("\n演示结束：以上结果均由本库当场计算，未使用预录输出。")
 
