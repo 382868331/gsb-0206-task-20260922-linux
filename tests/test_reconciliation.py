@@ -9,19 +9,25 @@
 
 from __future__ import annotations
 
+import dataclasses
 import math
 import unittest
 from itertools import product
 
-from reference import reference_reconcile
+from reference import reference_reconcile, reference_transfer_check
 
 from reconciliation import (
     DUPLICATION,
+    REASON_ANCESTOR_BRANCHES,
+    REASON_DISJOINT_INTERVALS,
+    REASON_SAME_BRANCH,
     SPECIATION,
     InvalidInputError,
     LeafMappingError,
+    ReconciliationResult,
     TreeStructureError,
     build_tree,
+    check_candidate_transfer,
     reconcile,
 )
 
@@ -481,6 +487,263 @@ class EventPathReplayTests(unittest.TestCase):
             )
             self.assertEqual(edge.loss_count, expect_losses)
             self.assertEqual(edge.loss_count, len(edge.lost_lineages))
+
+
+# ---------- 候选横向转移合法性检查 ----------
+
+#  y:(A,B), x:(y,C), r:(x,D)
+#  缺省时间（=深度）：r=0, x=1, y=2, C=2, A=B=3, D=1
+#  分支区间：A/B -> (2,3)，y -> (1,2)，C -> (1,2)，x -> (0,1)，D -> (0,1)
+
+
+class TransferHandCheckedTests(unittest.TestCase):
+    """手工可复验的候选横向转移例子，期望值硬编码。"""
+
+    def setUp(self):
+        self.sp = build_tree(SP, "r", name="species")
+        gn = build_tree({"gr": ("a", "b")}, "gr", name="gene")
+        self.res = reconcile(self.sp, gn, {"a": "A", "b": "B"})
+
+    def test_cousin_branches_feasible_with_endpoint_window(self):
+        """B、C 互不为祖先；区间 (2,3) 与 (1,2) 仅在端点 t=2 相交 => 零长度窗口。"""
+        out = check_candidate_transfer(self.res, "B", "C")
+        self.assertTrue(out.feasible)
+        self.assertIsNone(out.reason)
+        self.assertEqual((out.donor_branch, out.recipient_branch), ("B", "C"))
+        self.assertEqual(out.donor_interval, (2, 3))
+        self.assertEqual(out.recipient_interval, (1, 2))
+        self.assertEqual(out.feasible_interval, (2, 2))
+
+    def test_sister_branches_overlapping_with_custom_times(self):
+        """姐妹分支 A、B 共享父节点 y=5，区间 (5,8)/(5,9) => 窗口 (5,8)。"""
+        times = {"r": 0, "x": 1, "y": 5, "A": 8, "B": 9, "C": 6, "D": 7}
+        out = check_candidate_transfer(self.res, "A", "B", node_times=times)
+        self.assertTrue(out.feasible)
+        self.assertEqual(out.donor_interval, (5, 8))
+        self.assertEqual(out.recipient_interval, (5, 9))
+        self.assertEqual(out.feasible_interval, (5, 8))
+
+    def test_cousin_branches_different_both_bounds(self):
+        """堂表支 A、C 两区间两端都不同：(7,8) 与 (6,9) => 窗口 (7,8)。"""
+        times = {"r": 0, "x": 6, "y": 7, "A": 8, "B": 9, "C": 9, "D": 7}
+        out = check_candidate_transfer(self.res, "A", "C", node_times=times)
+        self.assertTrue(out.feasible)
+        self.assertEqual(out.donor_interval, (7, 8))
+        self.assertEqual(out.recipient_interval, (6, 9))
+        self.assertEqual(out.feasible_interval, (7, 8))
+
+    def test_window_can_equal_full_interval(self):
+        """一支区间完全包含另一支时，窗口等于较短区间。"""
+        times = {"r": 0, "x": 1, "y": 4, "A": 6, "B": 9, "C": 6, "D": 2}
+        out = check_candidate_transfer(self.res, "C", "A", node_times=times)
+        # C 支 (1,6)，A 支 (4,6) => 窗口 (4,6)
+        self.assertTrue(out.feasible)
+        self.assertEqual(out.feasible_interval, (4, 6))
+
+    def test_same_branch_rejected(self):
+        out = check_candidate_transfer(self.res, "A", "A")
+        self.assertFalse(out.feasible)
+        self.assertEqual(out.reason, REASON_SAME_BRANCH)
+        self.assertIsNone(out.feasible_interval)
+        self.assertEqual(out.donor_interval, out.recipient_interval)
+
+    def test_ancestor_branches_rejected_even_when_intervals_touch(self):
+        """x 与 y 是祖先/后裔分支：区间 (0,1) 与 (1,2) 在端点 t=1 相交，
+        但祖先判定优先，仍必须按祖先关系拒绝（不能误判为可转移）。"""
+        out = check_candidate_transfer(self.res, "x", "y")
+        self.assertEqual(out.donor_interval, (0, 1))
+        self.assertEqual(out.recipient_interval, (1, 2))
+        self.assertFalse(out.feasible)
+        self.assertEqual(out.reason, REASON_ANCESTOR_BRANCHES)
+        self.assertIsNone(out.feasible_interval)
+
+    def test_direct_parent_child_and_leaf_descendant_rejected(self):
+        """直接父子分支（y 与 A）及隔代（x 与 A/B）都按祖先关系拒绝。"""
+        for donor, recipient in (
+            ("y", "A"), ("A", "y"),
+            ("x", "A"), ("x", "B"),
+        ):
+            out = check_candidate_transfer(self.res, donor, recipient)
+            self.assertFalse(out.feasible, (donor, recipient))
+            self.assertEqual(out.reason, REASON_ANCESTOR_BRANCHES, (donor, recipient))
+
+    def test_disjoint_intervals_rejected(self):
+        """B 支 (2,3) 与 D 支 (0,1) 互不为祖先但时间不相交 => 拒绝。"""
+        out = check_candidate_transfer(self.res, "B", "D")
+        self.assertFalse(out.feasible)
+        self.assertEqual(out.reason, REASON_DISJOINT_INTERVALS)
+        self.assertEqual(out.donor_interval, (2, 3))
+        self.assertEqual(out.recipient_interval, (0, 1))
+        self.assertIsNone(out.feasible_interval)
+
+    def test_custom_times_make_disjoint_pair_feasible(self):
+        """同一对 B、D：把时间拉开（D 支延伸到 2..4）后区间相交 => 合法。"""
+        times = {"r": 0, "x": 1, "y": 2, "A": 3, "B": 3, "C": 2, "D": 4}
+        # 严格递增：x1 < D4 ✓；B 支 (2,3)，D 支 (1,4) => 窗口 (2,3)
+        out = check_candidate_transfer(self.res, "B", "D", node_times=times)
+        self.assertTrue(out.feasible)
+        self.assertEqual(out.feasible_interval, (2, 3))
+
+    def test_direction_symmetry(self):
+        """交换供体/受体不改变合法性、原因与窗口。"""
+        times = {"r": 0, "x": 1, "y": 5, "A": 8, "B": 9, "C": 6, "D": 7}
+        fwd = check_candidate_transfer(self.res, "A", "C", node_times=times)
+        rev = check_candidate_transfer(self.res, "C", "A", node_times=times)
+        self.assertEqual(fwd.feasible, rev.feasible)
+        self.assertEqual(fwd.reason, rev.reason)
+        self.assertEqual(fwd.feasible_interval, rev.feasible_interval)
+        self.assertEqual(fwd.donor_interval, rev.recipient_interval)
+
+
+class TransferInputValidationTests(unittest.TestCase):
+    def setUp(self):
+        self.sp = build_tree(SP, "r", name="species")
+        gn = build_tree({"gr": ("a", "b")}, "gr", name="gene")
+        self.res = reconcile(self.sp, gn, {"a": "A", "b": "B"})
+
+    def test_root_cannot_be_branch(self):
+        with self.assertRaises(InvalidInputError):
+            check_candidate_transfer(self.res, "r", "A")
+        with self.assertRaises(InvalidInputError):
+            check_candidate_transfer(self.res, "A", "r")
+
+    def test_unknown_and_bad_branch_labels(self):
+        with self.assertRaises(InvalidInputError):
+            check_candidate_transfer(self.res, "A", "ZZZ")
+        with self.assertRaises(InvalidInputError):
+            check_candidate_transfer(self.res, 42, "A")
+        with self.assertRaises(InvalidInputError):
+            check_candidate_transfer(self.res, "A", "")
+        with self.assertRaises(InvalidInputError):
+            check_candidate_transfer(self.res, None, "A")
+
+    def test_bad_result_object(self):
+        with self.assertRaises(InvalidInputError):
+            check_candidate_transfer(None, "A", "B")
+        with self.assertRaises(InvalidInputError):
+            check_candidate_transfer("not a result", "A", "B")
+        # 位置构造的旧式结果不带物种树：明确报错而非半更新。
+        bare = ReconciliationResult({}, (), (), {}, 0, 0, 0)
+        with self.assertRaises(InvalidInputError):
+            check_candidate_transfer(bare, "A", "B")
+
+    def test_bad_node_times(self):
+        good_times = {"r": 0, "x": 1, "y": 2, "A": 3, "B": 3, "C": 2, "D": 1}
+        check_candidate_transfer(self.res, "A", "C", node_times=good_times)  # 不抛错
+
+        with self.assertRaises(InvalidInputError):
+            check_candidate_transfer(self.res, "A", "C", node_times=[0, 1])
+        missing = dict(good_times)
+        del missing["B"]
+        with self.assertRaises(InvalidInputError):
+            check_candidate_transfer(self.res, "A", "C", node_times=missing)
+        extra = dict(good_times)
+        extra["ZZZ"] = 5
+        with self.assertRaises(InvalidInputError):
+            check_candidate_transfer(self.res, "A", "C", node_times=extra)
+        bool_times = dict(good_times)
+        bool_times["A"] = True  # bool 不当时间
+        with self.assertRaises(InvalidInputError):
+            check_candidate_transfer(self.res, "A", "C", node_times=bool_times)
+        float_times = dict(good_times)
+        float_times["A"] = 3.0
+        with self.assertRaises(InvalidInputError):
+            check_candidate_transfer(self.res, "A", "C", node_times=float_times)
+        nonincreasing = dict(good_times)
+        nonincreasing["x"] = 2  # 与 y 持平，不满足严格递增
+        with self.assertRaises(InvalidInputError):
+            check_candidate_transfer(self.res, "A", "C", node_times=nonincreasing)
+        backwards = dict(good_times)
+        backwards["x"] = 9  # x=9 > y=2，父子倒挂
+        with self.assertRaises(InvalidInputError):
+            check_candidate_transfer(self.res, "A", "C", node_times=backwards)
+
+    def test_single_leaf_species_has_no_branch(self):
+        sp = build_tree({}, "A", name="species")
+        gn = build_tree({}, "a", name="gene")
+        res = reconcile(sp, gn, {"a": "A"})
+        with self.assertRaises(InvalidInputError):
+            check_candidate_transfer(res, "A", "A")
+
+    def test_stateless_and_leaf_mapping_fixed(self):
+        """检查不修改复演结果；叶映射保持固定，失败调用后再做合法调用正常。"""
+        before = dataclasses.replace(self.res)
+        check_candidate_transfer(self.res, "x", "A")  # 祖先，拒绝
+        check_candidate_transfer(self.res, "B", "D")  # 时间不相交，拒绝
+        self.assertEqual(self.res, before)
+        self.assertEqual(
+            self.res.leaf_mapping, {"a": "A", "b": "B"}
+        )
+        # 失败的检查不留副作用：同一结果随后给出合法结论。
+        out = check_candidate_transfer(self.res, "B", "C")
+        self.assertTrue(out.feasible)
+        self.assertEqual(out.feasible_interval, (2, 2))
+        self.assertEqual(self.res, before)
+
+
+class TransferCrossCheckTests(unittest.TestCase):
+    """与独立参考穷举交叉核对：小树全部分支有序对 × 多组合法时间。"""
+
+    def _monotone_times(self, sp_tree, seed):
+        """确定性生成一组合法（根最老、严格递增）节点时间。"""
+        times = {sp_tree.root: 0}
+        # 自顶向下，按标签排序保证确定；不同 seed 给不同边长。
+        for node in sorted(sp_tree.internal, key=lambda n: sp_tree.depth[n]):
+            for i, child in enumerate(sp_tree.children[node]):
+                times[child] = times[node] + 1 + ((i + seed + sp_tree.depth[node]) % 3)
+        return times
+
+    def _run_family(self, sp_leaves):
+        k = len(sp_leaves)
+        checked = 0
+        for sp_shape in all_shapes(0, k):
+            sp_ch, sp_root = to_children(sp_shape, "s")
+            sp_ch = {
+                p: tuple(
+                    sp_leaves[int(c[4:])] if c.startswith("leaf") else c
+                    for c in pair
+                )
+                for p, pair in sp_ch.items()
+            }
+            sp_tree = build_tree(sp_ch, sp_root, name="species")
+            gn = build_tree({"gr": ("a", "b")}, "gr", name="gene")
+            res = reconcile(sp_tree, gn, {"a": sp_leaves[0], "b": sp_leaves[-1]})
+
+            branches = sorted(sp_tree.nodes - {sp_root})
+            time_sets = [None] + [self._monotone_times(sp_tree, s) for s in range(12)]
+            for times in time_sets:
+                for donor in branches:
+                    for recipient in branches:
+                        out = check_candidate_transfer(
+                            res, donor, recipient, node_times=times
+                        )
+                        (
+                            feasible,
+                            reason,
+                            di,
+                            ri,
+                            window,
+                        ) = reference_transfer_check(
+                            sp_ch, sp_root, donor, recipient, times
+                        )
+                        self.assertEqual(out.feasible, feasible,
+                                         (donor, recipient, times))
+                        self.assertEqual(out.reason, reason, (donor, recipient))
+                        self.assertEqual(out.donor_interval, di)
+                        self.assertEqual(out.recipient_interval, ri)
+                        self.assertEqual(out.feasible_interval, window)
+                        checked += 1
+        return checked
+
+    def test_species_3_leaves(self):
+        # 2 形状 × 4 分支 × 4 有序对 × 13 组时间 = 416
+        n = self._run_family(("A", "B", "C"))
+        self.assertGreater(n, 400)
+
+    def test_species_4_leaves(self):
+        # 5 形状 × 6 分支 × 6 有序对 × 13 组时间 = 2340
+        n = self._run_family(("A", "B", "C", "D"))
+        self.assertGreater(n, 2000)
 
 
 if __name__ == "__main__":

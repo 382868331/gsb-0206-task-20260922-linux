@@ -1,4 +1,5 @@
-"""固定输入演示：真实计算一次含复制与丢失的复演，并实际触发一个拒绝边界。
+"""固定输入演示：真实计算一次含复制与丢失的复演、候选横向转移合法性检查，
+并实际触发拒绝边界。
 
 运行：python demo.py
 数据全部在本文件内确定性给出，无网络、无外部数据、无 sleep、无预录结果。
@@ -9,9 +10,11 @@ from __future__ import annotations
 from reconciliation import (
     DUPLICATION,
     SPECIATION,
+    InvalidInputError,
     LeafMappingError,
     TreeStructureError,
     build_tree,
+    check_candidate_transfer,
     reconcile,
 )
 
@@ -111,7 +114,83 @@ def main():
     )
 
     print("=" * 72)
-    print("部分二：实际触发的拒绝边界（非叶映射 / 循环树，均不静默纠正）")
+    print("部分二：候选横向转移合法性检查（在上面的复演结果上，叶映射固定）")
+    print("=" * 72)
+    print(
+        "    物种树分支以下端节点标识，分支 (父 p, 子 c) 的时间区间为 [time(p), time(c)]。"
+        "\n    缺省时间：根 r=0，每条父子边 +1"
+        "（x=1, y=2, C=2, D=1, A=B=3）。"
+        "\n    合法条件：两条不同分支、互不为祖先、闭时间区间有公共时刻。"
+    )
+
+    def show_check(title, out):
+        print(f"\n  {title}")
+        print(f"    供体 {out.donor_branch} 区间 {out.donor_interval}；"
+              f"受体 {out.recipient_branch} 区间 {out.recipient_interval}")
+        if out.feasible:
+            lo, hi = out.feasible_interval
+            note = "（端点相交：零长度窗口，转移只能发生在该时刻）" if lo == hi else ""
+            print(f"    => 可行，可转移时间区间 {out.feasible_interval} {note}")
+        else:
+            print(f"    => 拒绝，原因 {out.reason}")
+
+    # [正常] 严格重叠窗口：自定义时间下 A 支 (7,8)、C 支 (6,9)。
+    wide_times = {"r": 0, "x": 6, "y": 7, "A": 8, "B": 9, "C": 9, "D": 7}
+    show_check(
+        "[正常] 堂表分支 A -> C（自定义时间，区间严格重叠）",
+        check_candidate_transfer(res, "A", "C", node_times=wide_times),
+    )
+
+    # [边界] 端点相交：缺省时间下 B 支 (2,3) 与 C 支 (1,2) 仅共享 t=2。
+    show_check(
+        "[边界] 堂表分支 B -> C（缺省时间，仅在端点 t=2 相交）",
+        check_candidate_transfer(res, "B", "C"),
+    )
+
+    # [失败 1] 祖先/后裔分支：x 支 (0,1) 与 y 支 (1,2) 在 t=1 端点相接，
+    #          但祖先判定优先，仍拒绝。
+    show_check(
+        "[失败] x -> y（祖先/后裔分支，拒绝优先于时间判定）",
+        check_candidate_transfer(res, "x", "y"),
+    )
+
+    # [失败 2] 互不为祖先但时间不相交：B 支 (2,3) 与 D 支 (0,1)。
+    show_check(
+        "[失败] B -> D（互不为祖先，但时间区间不相交）",
+        check_candidate_transfer(res, "B", "D"),
+    )
+
+    # [失败 3] 同一分支。
+    show_check(
+        "[失败] A -> A（同一分支，没有供体/受体之分）",
+        check_candidate_transfer(res, "A", "A"),
+    )
+
+    # [实际错误] 根没有入边，不能作为分支 —— 输入非法，明确报错。
+    try:
+        check_candidate_transfer(res, "r", "A")
+    except InvalidInputError as exc:
+        print(f"\n  [输入错误] 根节点充当分支被拒绝：{type(exc).__name__}: {exc}")
+
+    # [实际错误] 节点时间不满足沿父子边严格递增（y=2 不大于 x=2）。
+    bad_times = {"r": 0, "x": 2, "y": 2, "A": 3, "B": 3, "C": 3, "D": 3}
+    try:
+        check_candidate_transfer(res, "A", "C", node_times=bad_times)
+    except InvalidInputError as exc:
+        print(f"  [输入错误] 非严格递增时间被拒绝：{type(exc).__name__}: {exc}")
+
+    print(
+        """
+  手工复验：
+    缺省时间下 B 支为 [t(y),t(B)]=[2,3]，C 支为 [t(x),t(C)]=[1,2]，
+    交集为 [max(2,1), min(3,2)]=[2,2] —— 端点相交可行。
+    B 支 [2,3] 与 D 支 [t(r),t(D)]=[0,1] 交集为空（2>1）=> 时间不相交。
+    x、y 在同一条根-叶脉络上（y 是 x 的子节点）=> 祖先分支拒绝。
+  以上检查只读复演结果，叶映射与事件结果均未改变。"""
+    )
+
+    print("\n" + "=" * 72)
+    print("部分三：原有复演的拒绝边界（非叶映射 / 循环树，均不静默纠正）")
     print("=" * 72)
 
     # 边界 1：基因叶映到物种“内节点” x —— 必须拒绝，且可定位到基因叶。

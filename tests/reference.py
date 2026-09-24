@@ -104,3 +104,42 @@ def reference_reconcile(sp_children, sp_root, g_children, g_root, leaf_map):
 
     total = sum(edge_loss.values())
     return mapping, events, edge_loss, edge_sibs, total
+
+
+def reference_transfer_check(sp_children, sp_root, donor, recipient, node_times=None):
+    """独立参考：候选横向转移合法性（祖先集合 + 朴素区间相交，不调被测核心）。
+
+    返回 (feasible, reason, donor_interval, recipient_interval, feasible_interval)，
+    reason 取 "same_branch" / "ancestor_branches" / "disjoint_intervals" / None。
+    """
+    sp = RefTree(sp_children, sp_root)
+
+    if node_times is None:
+        # 缺省时间：根深度 0、每边 +1（用朴素爬升数边数）。
+        times = {}
+        for n in sp.nodes:
+            d, x = 0, n
+            while x != sp.root:
+                x = sp.parent[x]
+                d += 1
+            times[n] = d
+    else:
+        times = dict(node_times)
+
+    def interval(branch):
+        return (times[sp.parent[branch]], times[branch])
+
+    di, ri = interval(donor), interval(recipient)
+
+    if donor == recipient:
+        return False, "same_branch", di, ri, None
+
+    # 祖先关系：分支以下端节点标识，下端互含即同一条根-叶脉络。
+    if donor in sp.ancestors(recipient) or recipient in sp.ancestors(donor):
+        return False, "ancestor_branches", di, ri, None
+
+    lo = max(di[0], ri[0])
+    hi = min(di[1], ri[1])
+    if lo > hi:
+        return False, "disjoint_intervals", di, ri, None
+    return True, None, di, ri, (lo, hi)

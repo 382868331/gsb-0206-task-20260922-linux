@@ -4,12 +4,27 @@
 
 - build_tree(children, root=None, *, name=..., max_nodes=200) -> Tree
 - reconcile(species_tree, gene_tree, leaf_mapping, *, max_nodes=200) -> ReconciliationResult
-- 数据类型: Tree / Event / LostLineage / EdgeLoss / ReconciliationResult
+- check_candidate_transfer(result, donor, recipient, *, node_times=None)
+      -> TransferCheckResult   # 候选横向转移合法性（在既有复演结果上检查）
+- 数据类型: Tree / Event / LostLineage / EdgeLoss / ReconciliationResult /
+      TransferCheckResult
 - 错误类型:
     ReconciliationError
       ├─ InvalidInputError     # 类型/取值非法（含 bool 充整数、NaN/Infinity、超节点上限）
       ├─ TreeStructureError    # 树结构非法（多父、循环、不可达、非二叉等），可定位到节点
       └─ LeafMappingError      # 基因叶→物种叶映射非法（含非叶映射），可定位到基因叶
+
+横向转移检查契约（以 README 为准）：
+- 物种树的“分支”以其下端（子）节点标识（根节点没有入边，不是分支）。
+- 每个节点带整数时间（根最老、沿父子边严格递增；缺省为根深度 0、每边 +1），
+  分支 (父 p, 子 c) 的时间区间为闭区间 [time(p), time(c)]。
+- 候选供体/受体分支合法当且仅当：
+  1) 是两条不同分支；2) 互不为祖先（不在同一条根-叶脉络上）；
+  3) 两个闭时间区间有公共时刻。
+  合法时返回交集 [max(下界), min(上界)]（端点相交给零长度窗口 [t,t]）；
+  否则返回结构化拒绝原因（same_branch / ancestor_branches / disjoint_intervals）。
+- 检查在既有 ReconciliationResult 上进行，只读取物种树与固定的叶映射上下文，
+  不修改任何状态、不改变叶映射。
 
 契约摘要（以 README 为准）：
 - 两棵树均为有根二叉树，节点标签为非空 str，单棵树节点数 <= max_nodes（默认 200）。
@@ -37,18 +52,28 @@ __all__ = [
     "LostLineage",
     "EdgeLoss",
     "ReconciliationResult",
+    "TransferCheckResult",
     "build_tree",
     "reconcile",
+    "check_candidate_transfer",
     "ReconciliationError",
     "InvalidInputError",
     "TreeStructureError",
     "LeafMappingError",
     "SPECIATION",
     "DUPLICATION",
+    "REASON_SAME_BRANCH",
+    "REASON_ANCESTOR_BRANCHES",
+    "REASON_DISJOINT_INTERVALS",
 ]
 
 SPECIATION = "speciation"
 DUPLICATION = "duplication"
+
+# 候选横向转移的结构化拒绝原因（TransferCheckResult.reason 的取值）。
+REASON_SAME_BRANCH = "same_branch"
+REASON_ANCESTOR_BRANCHES = "ancestor_branches"
+REASON_DISJOINT_INTERVALS = "disjoint_intervals"
 
 # 题面给定的接口边界（单棵树节点数）。
 DEFAULT_MAX_NODES = 200
@@ -414,6 +439,8 @@ class ReconciliationResult:
         edge_losses: 逐基因父子边的丢失计数（后序父节点、先左后右）。
         losses_by_lineage: 各缺失物种支系 -> 被计为丢失的次数（按支系标签排序）。
         duplications / speciations / total_losses: 累计计数。
+        species_tree: 输入的物种树（供候选横向转移检查等后续步骤复用）。
+        leaf_mapping: 输入的基因叶 -> 物种叶映射（固定，不可变快照）。
     """
 
     mapping: Mapping[str, str]
@@ -423,6 +450,32 @@ class ReconciliationResult:
     duplications: int
     speciations: int
     total_losses: int
+    species_tree: Tree | None = None
+    leaf_mapping: Mapping[str, str] | None = None
+
+
+@dataclass(frozen=True)
+class TransferCheckResult:
+    """候选横向转移（供体分支 -> 受体分支）的合法性检查结果（不可变）。
+
+    Attributes:
+        feasible: 该候选转移是否合法。
+        reason: 拒绝原因；合法时为 ``None``，否则为
+            ``REASON_SAME_BRANCH`` / ``REASON_ANCESTOR_BRANCHES`` /
+            ``REASON_DISJOINT_INTERVALS`` 之一。
+        donor_branch / recipient_branch: 供体/受体分支（以下端节点标识）。
+        donor_interval / recipient_interval: 两条分支的时间区间 ``(下界, 上界)``。
+        feasible_interval: 合法时两区间的公共时刻区间 ``(下界, 上界)``；
+            拒绝时为 ``None``。端点相交给零长度窗口 ``(t, t)``。
+    """
+
+    feasible: bool
+    reason: str | None
+    donor_branch: str
+    recipient_branch: str
+    donor_interval: tuple[int, int]
+    recipient_interval: tuple[int, int]
+    feasible_interval: tuple[int, int] | None
 
 
 def _lca(species: Tree, a: str, b: str) -> str:
@@ -619,4 +672,147 @@ def reconcile(
         duplications=duplications,
         speciations=speciations,
         total_losses=total_losses,
+        species_tree=species_tree,
+        leaf_mapping=dict(sorted(raw_mapping.items())),
+    )
+
+
+def _is_ancestor(species: Tree, anc: str, desc: str) -> bool:
+    """``anc`` 是否为 ``desc`` 的祖先（含自身）。"""
+    cur = desc
+    while True:
+        if cur == anc:
+            return True
+        parent = species.parent.get(cur)
+        if parent is None:
+            return False
+        cur = parent
+
+
+def check_candidate_transfer(
+    result: ReconciliationResult,
+    donor: str,
+    recipient: str,
+    *,
+    node_times: Mapping[str, int] | None = None,
+) -> TransferCheckResult:
+    """在既有复演结果上检查一条候选横向转移（供体分支 -> 受体分支）的合法性。
+
+    分支以其下端（子）节点标识；根节点没有入边，不能作为分支。
+    叶映射沿用 ``result`` 中已固定的映射，本函数不修改任何状态。
+
+    Args:
+        result: ``reconcile`` 产出的复演结果（携带物种树与固定叶映射）。
+        donor: 供体分支的下端节点标签（物种树非根节点）。
+        recipient: 受体分支的下端节点标签（物种树非根节点）。
+        node_times: 可选的节点时间映射 ``{节点: int}``。省略时按
+            “根深度 0、每条父子边 +1”取缺省时间。给定时必须覆盖全部节点、
+            值为 ``int``（拒绝 bool），且沿每条父子边严格递增。
+
+    Returns:
+        TransferCheckResult：合法时 ``feasible=True`` 并给出
+        ``feasible_interval``（两分支时间区间的公共时刻区间，端点相交为
+        零长度窗口 ``(t, t)``）；否则 ``feasible=False`` 且 ``reason``
+        为 ``REASON_SAME_BRANCH`` / ``REASON_ANCESTOR_BRANCHES`` /
+        ``REASON_DISJOINT_INTERVALS`` 之一。
+
+    Raises:
+        InvalidInputError: 参数类型/取值非法（result 非本库结果、分支标签
+            非法或不是物种树非根节点、node_times 非法等）。
+    """
+    if not isinstance(result, ReconciliationResult):
+        raise InvalidInputError(
+            f"result 必须为 reconcile 产出的 ReconciliationResult，"
+            f"实际为 {type(result).__name__}"
+        )
+    species = result.species_tree
+    if species is None:
+        raise InvalidInputError("result 未携带物种树，无法检查候选转移")
+
+    donor = _require_label(donor, "供体分支 donor")
+    recipient = _require_label(recipient, "受体分支 recipient")
+    for label, branch in (("供体分支 donor", donor), ("受体分支 recipient", recipient)):
+        if branch not in species.nodes:
+            raise InvalidInputError(
+                f"{label} {branch!r} 不是物种树 {species.name!r} 中的节点"
+            )
+        if branch == species.root:
+            raise InvalidInputError(
+                f"{label} {branch!r} 是物种树根节点；根没有入边，不能作为分支"
+            )
+
+    # ---- 节点时间：缺省为根深度 0、每边 +1；或校验用户给定的时间 ----
+    if node_times is None:
+        times = {n: species.depth[n] for n in species.nodes}
+    else:
+        if not isinstance(node_times, Mapping):
+            raise InvalidInputError(
+                f"node_times 必须为 Mapping，实际类型为 {type(node_times).__name__}"
+            )
+        times = {}
+        for node in species.nodes:
+            if node not in node_times:
+                raise InvalidInputError(
+                    f"node_times 缺少节点 {node!r} 的时间（必须覆盖全部节点）"
+                )
+            value = node_times[node]
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise InvalidInputError(
+                    f"节点 {node!r} 的时间必须为 int 且不能是 bool，"
+                    f"实际为 {value!r}（{type(value).__name__}）"
+                )
+            times[node] = value
+        extra = sorted(set(node_times) - species.nodes)
+        if extra:
+            raise InvalidInputError(
+                f"node_times 含有物种树之外的节点：{extra}"
+            )
+        for parent, (c0, c1) in species.children.items():
+            for child in (c0, c1):
+                if times[child] <= times[parent]:
+                    raise InvalidInputError(
+                        f"节点时间必须沿父子边严格递增："
+                        f"time({parent!r})={times[parent]} 不小于 "
+                        f"time({child!r})={times[child]}"
+                    )
+
+    donor_interval = (times[species.parent[donor]], times[donor])
+    recipient_interval = (times[species.parent[recipient]], times[recipient])
+
+    def reject(reason: str) -> TransferCheckResult:
+        return TransferCheckResult(
+            feasible=False,
+            reason=reason,
+            donor_branch=donor,
+            recipient_branch=recipient,
+            donor_interval=donor_interval,
+            recipient_interval=recipient_interval,
+            feasible_interval=None,
+        )
+
+    # 1) 同一分支：没有供体/受体之分。
+    if donor == recipient:
+        return reject(REASON_SAME_BRANCH)
+
+    # 2) 祖先关系：两条分支在同一条根-叶脉络上，转移在时间上不可能
+    #    （一支完全早于另一支，属于纵向遗传而非横向转移）。
+    if _is_ancestor(species, donor, recipient) or _is_ancestor(
+        species, recipient, donor
+    ):
+        return reject(REASON_ANCESTOR_BRANCHES)
+
+    # 3) 时间区间相交：闭区间相交 <=> 存在公共时刻（端点相交也算）。
+    lo = max(donor_interval[0], recipient_interval[0])
+    hi = min(donor_interval[1], recipient_interval[1])
+    if lo > hi:
+        return reject(REASON_DISJOINT_INTERVALS)
+
+    return TransferCheckResult(
+        feasible=True,
+        reason=None,
+        donor_branch=donor,
+        recipient_branch=recipient,
+        donor_interval=donor_interval,
+        recipient_interval=recipient_interval,
+        feasible_interval=(lo, hi),
     )
