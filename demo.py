@@ -13,6 +13,7 @@ from reconciliation import (
     TreeStructureError,
     build_tree,
     reconcile,
+    reconcile_with_candidates,
 )
 
 
@@ -130,8 +131,67 @@ def main():
         print(f"    循环树被拒绝：{type(exc).__name__}: {exc}")
         print(f"    （定位字段 tree={exc.tree!r}, node={exc.node!r}）")
 
+    print()
+
+
+def demo_candidates():
+    print("=" * 72)
+    print("部分三：候选物种叶集合的联合归属（正常路径）")
+    print("=" * 72)
+
+    # 物种树:
+    #        root
+    #        /  \\
+    #      ab    cd
+    #     / \\  / \\
+    #    A   B C   D
+    sp = build_tree(
+        {"ab": ("A", "B"), "cd": ("C", "D"), "root": ("ab", "cd")},
+        "root",
+        name="species",
+    )
+    # 基因树:
+    #        g
+    #       / \\
+    #      g1  z
+    #     / \\
+    #    x   y
+    gn = build_tree({"g1": ("x", "y"), "g": ("g1", "z")}, "g", name="gene")
+    # x/y 带候选集合，z 单归属；权重 dup=1, loss=1。
+    cands = {"x": {"A", "B"}, "y": {"A", "B"}, "z": "D"}
+    print("候选输入：x,y ∈ {A,B}；z 固定 D；权重 dup_weight=1, loss_weight=1")
+    res = reconcile_with_candidates(sp, gn, cands, dup_weight=1, loss_weight=1)
+    print(f"    complete={res.complete}, 最优成本={res.optimal_cost}")
+    print(f"    选定归属: {res.assignments}")
+    rec = res.reconciliation
+    print(
+        f"    事件账本: duplication={rec.duplications}, "
+        f"speciation={rec.speciations}, 总丢失={rec.total_losses}"
+    )
+    for ev in rec.events:
+        print(f"    {ev.gene_node}: {ev.event_type} @ {ev.mapped_species}")
+    print(
+        "    复验：x,y 同选 A（或同选 B）会使 g1 成为 duplication（额外成本 1）；\n"
+        "    联合最优 x->A, y->B 让 g1 落在 ab 上成分化（0 复制）；\n"
+        "    唯一丢失来自 z 固定 D：边 g->z 路径 root->cd->D 丢 1，不可避免；\n"
+        "    平局 (A,B) vs (B,A) 按基因叶 ID 序的物种序列取字典序最小 => (A,B)。"
+    )
+
+    print()
+    print("=" * 72)
+    print("部分四：实际触发的边界——搜索预算耗尽（incomplete，非报错）")
+    print("=" * 72)
+    wide = {"x": {"A", "B", "C", "D"}, "y": {"A", "B", "C", "D"}, "z": "D"}
+    res2 = reconcile_with_candidates(sp, gn, wide, max_relaxations=1)
+    print(f"    complete={res2.complete}, optimal_cost={res2.optimal_cost}")
+    print(f"    最优已知映射: {res2.assignments}, 其成本={res2.best_cost}")
+    print(
+        f"    账本仍可验证: duplication={res2.reconciliation.duplications}, "
+        f"总丢失={res2.reconciliation.total_losses}"
+    )
     print("\n演示结束：以上结果均由本库当场计算，未使用预录输出。")
 
 
 if __name__ == "__main__":
     main()
+    demo_candidates()

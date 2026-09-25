@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import math
 from collections import deque
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Mapping, Sequence
 
@@ -37,12 +38,15 @@ __all__ = [
     "LostLineage",
     "EdgeLoss",
     "ReconciliationResult",
+    "CandidateReconciliationResult",
     "build_tree",
     "reconcile",
+    "reconcile_with_candidates",
     "ReconciliationError",
     "InvalidInputError",
     "TreeStructureError",
     "LeafMappingError",
+    "CandidateMappingError",
     "SPECIATION",
     "DUPLICATION",
 ]
@@ -84,6 +88,10 @@ class LeafMappingError(ReconciliationError):
         self.gene_leaf = gene_leaf
         prefix = f"[基因叶 {gene_leaf!r}] " if gene_leaf is not None else ""
         super().__init__(prefix + message)
+
+
+class CandidateMappingError(LeafMappingError):
+    """候选物种叶集合非法（空集、含非叶/未知节点等）；仍是 LeafMappingError。"""
 
 
 def _check_max_nodes(max_nodes: object) -> int:
@@ -619,4 +627,302 @@ def reconcile(
         duplications=duplications,
         speciations=speciations,
         total_losses=total_losses,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 候选物种叶集合：联合选择每个基因叶的归属，最小化加权 duplication+loss。
+# ---------------------------------------------------------------------------
+
+# DP 松弛工作量默认预算（sum over 内节点 of |maps(左子)| * |maps(右子)|）。
+DEFAULT_MAX_RELAXATIONS = 4_000_000
+
+
+@dataclass(frozen=True)
+class CandidateReconciliationResult:
+    """候选归属搜索结果（不可变）。
+
+    Attributes:
+        complete: True 表示已证明最优；False 表示搜索预算耗尽（incomplete），
+            此时返回的是最优已知映射，optimal_cost 为 None。
+        assignments: 每个基因叶最终选定的物种叶。
+        optimal_cost: 已证明的最优目标值（complete 时非 None）。
+        best_cost: 返回映射实际达到的目标值（可验证，complete 时 == optimal_cost）。
+        reconciliation: 对 assignments 做标准 LCA 复演的完整事件账本。
+        relaxation_work: 实际消耗的 DP 松弛工作量。
+    """
+
+    complete: bool
+    assignments: Mapping[str, str]
+    optimal_cost: int | None
+    best_cost: int
+    reconciliation: ReconciliationResult
+    relaxation_work: int
+
+
+class _BudgetExceeded(Exception):
+    """内部控制流：DP 松弛工作量超过预算。"""
+
+    def __init__(self, work: int):
+        self.work = work
+        super().__init__(f"relaxation work exceeded budget: {work}")
+
+
+def _check_weight(value: object, name: str) -> int:
+    """权重校验：非负 int，拒绝 bool 与一切非 int（含 NaN/Infinity）。"""
+    if isinstance(value, bool) or not isinstance(value, int):
+        if isinstance(value, float):
+            if math.isnan(value):
+                raise InvalidInputError(f"{name} 不能为 NaN")
+            if math.isinf(value):
+                raise InvalidInputError(f"{name} 不能为 Infinity/-Infinity")
+        raise InvalidInputError(
+            f"{name} 必须为非负 int 且不能是 bool，实际类型为 {type(value).__name__}"
+        )
+    if value < 0:
+        raise InvalidInputError(f"{name} 必须为非负整数，实际为 {value}")
+    return value
+
+
+def _check_max_relaxations(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise InvalidInputError(
+            f"max_relaxations 必须为正 int 且不能是 bool，实际类型为 {type(value).__name__}"
+        )
+    if value < 1:
+        raise InvalidInputError(f"max_relaxations 必须为正整数，实际为 {value}")
+    return value
+
+
+def _normalize_candidates(
+    species_tree: Tree, gene_tree: Tree, leaf_candidates: Mapping[str, object]
+) -> dict[str, tuple[str, ...]]:
+    """校验并规范化候选输入：每个基因叶 -> 去重后排序的候选物种叶元组。
+
+    单条 str 视为单候选（与旧行为一致）；其余必须是可迭代的非空 str 集合。
+    """
+    if not isinstance(leaf_candidates, Mapping):
+        raise InvalidInputError(
+            f"leaf_candidates 必须为 Mapping，实际类型为 {type(leaf_candidates).__name__}"
+        )
+    gene_leaves = gene_tree.leaves
+    normalized: dict[str, tuple[str, ...]] = {}
+    for key, value in leaf_candidates.items():
+        if not isinstance(key, str) or isinstance(key, bool) or key == "":
+            raise CandidateMappingError(
+                f"leaf_candidates 的键必须是非空 str，实际为 {key!r}（{type(key).__name__}）"
+            )
+        g = key
+        if g not in gene_leaves:
+            if g in gene_tree.internal:
+                raise CandidateMappingError(
+                    "候选键必须是基因叶，不能是基因内节点", gene_leaf=g
+                )
+            raise CandidateMappingError("不是基因树中的节点", gene_leaf=g)
+        if isinstance(value, str):
+            raw = [value]
+        else:
+            if not isinstance(value, Iterable) or isinstance(value, (bytes,)):
+                raise CandidateMappingError(
+                    f"候选必须是非空 str 或 str 的可迭代集合，实际为 {value!r}"
+                    f"（{type(value).__name__}）",
+                    gene_leaf=g,
+                )
+            raw = list(value)
+        if not raw:
+            raise CandidateMappingError("候选集合不能为空", gene_leaf=g)
+        deduped = sorted(set(raw))
+        for s in deduped:
+            if not isinstance(s, str) or isinstance(s, bool) or s == "":
+                raise CandidateMappingError(
+                    f"候选目标必须是非空 str，实际为 {s!r}（{type(s).__name__}）",
+                    gene_leaf=g,
+                )
+            if s not in species_tree.nodes:
+                raise CandidateMappingError(
+                    f"候选目标 {s!r} 不是物种树中的节点", gene_leaf=g
+                )
+            if s in species_tree.internal:
+                raise CandidateMappingError(
+                    f"候选目标 {s!r} 是物种内节点，候选必须全是物种叶",
+                    gene_leaf=g,
+                )
+        normalized[g] = tuple(deduped)
+    missing = sorted(gene_leaves - normalized.keys())
+    if missing:
+        raise CandidateMappingError(
+            f"存在未给出候选的基因叶：{missing}", gene_leaf=missing[0]
+        )
+    return normalized
+
+
+def _gene_internal_postorder(gene_tree: Tree) -> list[str]:
+    postorder: list[str] = []
+    stack: list[tuple[str, bool]] = [(gene_tree.root, False)]
+    while stack:
+        node, expanded = stack.pop()
+        pair = gene_tree.children.get(node)
+        if pair is None:
+            continue
+        if expanded:
+            postorder.append(node)
+            continue
+        stack.append((node, True))
+        stack.append((pair[1], False))
+        stack.append((pair[0], False))
+    return postorder
+
+
+def _dp_optimal_cost(
+    species_tree: Tree,
+    gene_tree: Tree,
+    postorder: list[str],
+    candidates: Mapping[str, tuple[str, ...]],
+    fixed: Mapping[str, str],
+    dup_weight: int,
+    loss_weight: int,
+    budget: int,
+) -> tuple[int, int]:
+    """树 DP：给定部分叶已固定，求子树最小加权成本与松弛工作量。
+
+    状态 = 基因节点映射到的物种节点（只保留可达 LCA，故每节点状态数
+    以物种树节点数为界）；转移时把事件成本（本节点）与两条子边丢失
+    一并计入。预算耗尽抛 _BudgetExceeded。
+    """
+    g_children = gene_tree.children
+    s_depth = species_tree.depth
+    work = 0
+    # node -> {species_node: min_cost}
+    table: dict[str, dict[str, int]] = {}
+    for leaf in gene_tree.leaves:
+        if leaf in fixed:
+            table[leaf] = {fixed[leaf]: 0}
+        else:
+            table[leaf] = {c: 0 for c in candidates[leaf]}
+    for node in postorder:
+        c0, c1 = g_children[node]
+        m0, m1 = table[c0], table[c1]
+        work += len(m0) * len(m1)
+        if work > budget:
+            raise _BudgetExceeded(work)
+        cell: dict[str, int] = {}
+        for t0, cost0 in m0.items():
+            for t1, cost1 in m1.items():
+                s = _lca(species_tree, t0, t1)
+                is_dup = t0 == s or t1 == s
+                edge0 = s_depth[t0] - s_depth[s]
+                edge1 = s_depth[t1] - s_depth[s]
+                cost = cost0 + cost1
+                if is_dup:
+                    cost += dup_weight + loss_weight * (edge0 + edge1)
+                else:
+                    cost += loss_weight * (edge0 + edge1 - 2)
+                prev = cell.get(s)
+                if prev is None or cost < prev:
+                    cell[s] = cost
+        table[node] = cell
+    return min(table[gene_tree.root].values()), work
+
+
+def reconcile_with_candidates(
+    species_tree: Tree,
+    gene_tree: Tree,
+    leaf_candidates: Mapping[str, object],
+    *,
+    dup_weight: int = 1,
+    loss_weight: int = 1,
+    max_nodes: int = DEFAULT_MAX_NODES,
+    max_relaxations: int = DEFAULT_MAX_RELAXATIONS,
+) -> CandidateReconciliationResult:
+    """为带候选物种叶集合的基因叶联合选择归属，最小化加权事件成本。
+
+    目标：min  dup_weight * duplications + loss_weight * total_losses；
+    平局按基因叶 ID（字典序）对应的物种 ID 序列取字典序最小者。
+    选择完成后仍按原 LCA 规则复演（不能逐叶独立选最近物种——
+    候选选择会改变祖先 LCA，必须联合优化）。
+
+    Args:
+        species_tree / gene_tree: ``build_tree`` 构造的树。
+        leaf_candidates: 每个基因叶 -> 单个物种叶 str（与旧输入等价）
+            或候选物种叶的非空可迭代集合（重复候选自动去重）。
+        dup_weight / loss_weight: 非负 int 权重（拒绝 bool/浮点/负数）。
+        max_nodes: 接口边界参数（同 reconcile）。
+        max_relaxations: DP 松弛工作量预算；耗尽时不报错，而是返回
+            ``complete=False`` 的结果（最优已知映射 + 可验证事件账本）。
+
+    Returns:
+        CandidateReconciliationResult。
+
+    Raises:
+        InvalidInputError: 参数类型/取值非法。
+        CandidateMappingError: 候选集合非法（LeafMappingError 子类）。
+    """
+    _check_max_nodes(max_nodes)
+    dup_w = _check_weight(dup_weight, "dup_weight")
+    loss_w = _check_weight(loss_weight, "loss_weight")
+    budget = _check_max_relaxations(max_relaxations)
+    if not isinstance(species_tree, Tree):
+        raise InvalidInputError(
+            f"species_tree 必须为 build_tree 产出的 Tree，实际为 {type(species_tree).__name__}"
+        )
+    if not isinstance(gene_tree, Tree):
+        raise InvalidInputError(
+            f"gene_tree 必须为 build_tree 产出的 Tree，实际为 {type(gene_tree).__name__}"
+        )
+    candidates = _normalize_candidates(species_tree, gene_tree, leaf_candidates)
+    postorder = _gene_internal_postorder(gene_tree)
+
+    def fallback_result(work: int) -> CandidateReconciliationResult:
+        # 预算耗尽：最优已知映射取每叶字典序最小候选，账本仍可完整验证。
+        assignments = {g: cs[0] for g, cs in candidates.items()}
+        rec = reconcile(species_tree, gene_tree, assignments, max_nodes=max_nodes)
+        best = dup_w * rec.duplications + loss_w * rec.total_losses
+        return CandidateReconciliationResult(
+            complete=False,
+            assignments=dict(sorted(assignments.items())),
+            optimal_cost=None,
+            best_cost=best,
+            reconciliation=rec,
+            relaxation_work=work,
+        )
+
+    try:
+        best_cost, work = _dp_optimal_cost(
+            species_tree, gene_tree, postorder, candidates, {}, dup_w, loss_w, budget
+        )
+    except _BudgetExceeded as exc:
+        return fallback_result(exc.work)
+
+    # 平局消解：按基因叶 ID 顺序逐叶固定为仍能达到最优值的最小候选，
+    # 精确得到“物种 ID 序列字典序最小”的最优映射（逐叶可行性由 DP 重算保证）。
+    fixed: dict[str, str] = {}
+    for g in sorted(gene_tree.leaves):
+        cs = candidates[g]
+        if len(cs) == 1:
+            continue
+        for c in cs:
+            fixed[g] = c
+            cost, _ = _dp_optimal_cost(
+                species_tree, gene_tree, postorder, candidates, fixed,
+                dup_w, loss_w, budget,
+            )
+            if cost == best_cost:
+                break
+        else:  # pragma: no cover - 不变式保护，理论上不可达
+            raise AssertionError(f"基因叶 {g!r} 无可行候选保持最优值")
+
+    assignments = {g: fixed.get(g, candidates[g][0]) for g in gene_tree.leaves}
+    for g, cs in candidates.items():
+        if len(cs) == 1:
+            assignments[g] = cs[0]
+    rec = reconcile(species_tree, gene_tree, assignments, max_nodes=max_nodes)
+    final_cost = dup_w * rec.duplications + loss_w * rec.total_losses
+    assert final_cost == best_cost, (final_cost, best_cost)
+    return CandidateReconciliationResult(
+        complete=True,
+        assignments=dict(sorted(assignments.items())),
+        optimal_cost=best_cost,
+        best_cost=final_cost,
+        reconciliation=rec,
+        relaxation_work=work,
     )
