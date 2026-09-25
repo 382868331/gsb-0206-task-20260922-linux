@@ -483,5 +483,126 @@ class EventPathReplayTests(unittest.TestCase):
             self.assertEqual(edge.loss_count, len(edge.lost_lineages))
 
 
+class CandidateOptimizationTests(unittest.TestCase):
+    def test_joint_choice_beats_independent_nearest_choices(self):
+        sp = build_tree({"u": ("A", "B"), "v": ("C", "D"), "r": ("u", "v")}, "r")
+        gn = build_tree({"p": ("x", "y"), "r": ("p", "z")}, "r")
+
+        res = reconcile(
+            sp,
+            gn,
+            {"z": "C"},
+            leaf_candidates={"x": ("A", "B"), "y": ("A", "B")},
+        )
+        independent = reconcile(sp, gn, {"x": "A", "y": "A", "z": "C"})
+
+        self.assertTrue(res.complete)
+        self.assertEqual(res.leaf_assignment, {"x": "A", "y": "B", "z": "C"})
+        self.assertEqual((res.duplications, res.total_losses, res.optimal_cost), (0, 1, 1))
+        self.assertEqual((independent.duplications, independent.total_losses), (1, 2))
+
+    def test_small_candidate_combinations_are_enumerated_for_cross_check(self):
+        sp = build_tree({"u": ("A", "B"), "v": ("C", "D"), "r": ("u", "v")}, "r")
+        gn = build_tree({"p": ("x", "y"), "r": ("p", "z")}, "r")
+        candidate_sets = {"x": ("A", "B", "C"), "y": ("B", "C", "D")}
+        res = reconcile(sp, gn, {"z": "A"}, leaf_candidates=candidate_sets)
+
+        best_assignment = None
+        best_key = None
+        for x_species, y_species in product(candidate_sets["x"], candidate_sets["y"]):
+            fixed = reconcile(sp, gn, {"x": x_species, "y": y_species, "z": "A"})
+            key = (fixed.duplications + fixed.total_losses, (x_species, y_species))
+            if best_key is None or key < best_key:
+                best_key = key
+                best_assignment = {"x": x_species, "y": y_species, "z": "A"}
+
+        self.assertEqual(res.leaf_assignment, best_assignment)
+        self.assertEqual(res.optimal_cost, best_key[0])
+        self.assertEqual(res.optimal_cost, res.duplications + res.total_losses)
+
+    def test_zero_weights_use_leaf_id_species_id_sequence_tie_break(self):
+        sp = build_tree({"u": ("A", "B"), "v": ("C", "D"), "r": ("u", "v")}, "r")
+        gn = build_tree({"r": ("x", "y")}, "r")
+        res = reconcile(
+            sp,
+            gn,
+            {},
+            leaf_candidates={"x": ("A", "D"), "y": ("A", "D")},
+            duplication_weight=0,
+            loss_weight=0,
+        )
+
+        self.assertTrue(res.complete)
+        self.assertEqual(res.optimal_cost, 0)
+        self.assertEqual(res.leaf_assignment, {"x": "A", "y": "A"})
+
+    def test_candidate_dedup_validation_and_multiple_genes_per_species(self):
+        sp = build_tree({"r": ("A", "B")}, "r")
+        gn = build_tree({"p": ("x", "y"), "r": ("p", "q")}, "r")
+        res = reconcile(
+            sp,
+            gn,
+            {"y": "A", "q": "A"},
+            leaf_candidates={"x": ["A", "A", "B"]},
+        )
+
+        self.assertEqual(res.leaf_assignment, {"x": "A", "y": "A", "q": "A"})
+        self.assertEqual((res.mapping["y"], res.mapping["q"]), ("A", "A"))
+
+        with self.assertRaises(LeafMappingError):
+            reconcile(sp, gn, {"y": "A", "q": "A"}, leaf_candidates={"x": ()})
+        with self.assertRaises(LeafMappingError):
+            reconcile(sp, gn, {"y": "A", "q": "A"}, leaf_candidates={"x": ("r",)})
+        with self.assertRaises(InvalidInputError):
+            reconcile(
+                sp,
+                gn,
+                {"y": "A", "q": "A"},
+                leaf_candidates={"x": ("A", "B")},
+                duplication_weight=-1,
+            )
+        with self.assertRaises(InvalidInputError):
+            reconcile(
+                sp,
+                gn,
+                {"y": "A", "q": "A"},
+                leaf_candidates={"x": ("A", "B")},
+                loss_weight=True,
+            )
+        with self.assertRaises(InvalidInputError):
+            reconcile(
+                sp,
+                gn,
+                {"y": "A", "q": "A"},
+                leaf_candidates={"x": ("A", "B")},
+                max_search_states=0,
+            )
+
+    def test_incomplete_search_keeps_feasible_verifiable_ledger(self):
+        sp = build_tree({"u": ("A", "B"), "v": ("C", "D"), "r": ("u", "v")}, "r")
+        gn = build_tree({"r": ("x", "y")}, "r")
+        res = reconcile(
+            sp,
+            gn,
+            {},
+            leaf_candidates={"x": ("A", "B", "C", "D"), "y": ("A", "B", "C", "D")},
+            max_search_states=1,
+        )
+
+        self.assertFalse(res.complete)
+        self.assertEqual(res.states_explored, 1)
+        replayed = reconcile(sp, gn, res.leaf_assignment)
+        self.assertEqual(res.mapping, replayed.mapping)
+        self.assertEqual(
+            [(e.gene_node, e.event_type, e.child_maps) for e in res.events],
+            [(e.gene_node, e.event_type, e.child_maps) for e in replayed.events],
+        )
+        self.assertEqual(
+            [(e.parent_gene, e.child_gene, e.loss_count) for e in res.edge_losses],
+            [(e.parent_gene, e.child_gene, e.loss_count) for e in replayed.edge_losses],
+        )
+        self.assertEqual(res.optimal_cost, res.duplications + res.total_losses)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

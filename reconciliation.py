@@ -29,7 +29,8 @@ from __future__ import annotations
 import math
 from collections import deque
 from dataclasses import dataclass
-from typing import Mapping, Sequence
+from types import MappingProxyType
+from typing import Collection, Mapping, Sequence
 
 __all__ = [
     "Tree",
@@ -45,6 +46,7 @@ __all__ = [
     "LeafMappingError",
     "SPECIATION",
     "DUPLICATION",
+    "DEFAULT_SEARCH_STATES",
 ]
 
 SPECIATION = "speciation"
@@ -52,6 +54,7 @@ DUPLICATION = "duplication"
 
 # 题面给定的接口边界（单棵树节点数）。
 DEFAULT_MAX_NODES = 200
+DEFAULT_SEARCH_STATES = 100_000
 
 
 class ReconciliationError(ValueError):
@@ -423,6 +426,11 @@ class ReconciliationResult:
     duplications: int
     speciations: int
     total_losses: int
+    optimal_cost: int = 0
+    leaf_assignment: Mapping[str, str] | None = None
+    weights: Mapping[str, int] = MappingProxyType({"duplication": 1, "loss": 1})
+    complete: bool = True
+    states_explored: int = 0
 
 
 def _lca(species: Tree, a: str, b: str) -> str:
@@ -439,7 +447,27 @@ def _lca(species: Tree, a: str, b: str) -> str:
     return a
 
 
-def reconcile(
+def _check_non_negative_int(value: object, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise InvalidInputError(
+            f"{name} 必须为非负 int 且不能是 bool，实际类型为 {type(value).__name__}"
+        )
+    if value < 0:
+        raise InvalidInputError(f"{name} 不能为负数，实际为 {value}")
+    return value
+
+
+def _check_search_budget(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise InvalidInputError(
+            f"max_search_states 必须为正 int 且不能是 bool，实际类型为 {type(value).__name__}"
+        )
+    if value < 1:
+        raise InvalidInputError(f"max_search_states 必须为正整数，实际为 {value}")
+    return value
+
+
+def _reconcile_fixed(
     species_tree: Tree,
     gene_tree: Tree,
     leaf_mapping: Mapping[str, str],
@@ -619,4 +647,361 @@ def reconcile(
         duplications=duplications,
         speciations=speciations,
         total_losses=total_losses,
+        optimal_cost=duplications + total_losses,
+        leaf_assignment=dict(sorted(raw_mapping.items())),
+    )
+
+
+def _validate_gene_leaf_key(key: object) -> str:
+    if not isinstance(key, str) or isinstance(key, bool) or key == "":
+        raise LeafMappingError(
+            f"映射键必须是非空 str，实际为 {key!r}（{type(key).__name__}）"
+        )
+    return key
+
+
+def _validate_species_leaf(
+    species_tree: Tree,
+    value: object,
+    gene_leaf: str,
+    *,
+    target_name: str = "映射目标",
+) -> str:
+    if not isinstance(value, str) or isinstance(value, bool) or value == "":
+        raise LeafMappingError(
+            f"基因叶 {gene_leaf!r} 的{target_name}必须是非空 str，实际为 {value!r}"
+            f"（{type(value).__name__}）",
+            gene_leaf=gene_leaf,
+        )
+    if value not in species_tree.nodes:
+        raise LeafMappingError(
+            f"{target_name} {value!r} 不是物种树中的节点", gene_leaf=gene_leaf
+        )
+    if value in species_tree.internal:
+        raise LeafMappingError(
+            f"{target_name} {value!r} 是物种内节点，基因叶只能映射到物种叶（拒绝非叶映射）",
+            gene_leaf=gene_leaf,
+        )
+    return value
+
+
+def _gene_postorder(gene_tree: Tree) -> list[str]:
+    order: list[str] = []
+    stack: list[tuple[str, bool]] = [(gene_tree.root, False)]
+    while stack:
+        node, expanded = stack.pop()
+        pair = gene_tree.children.get(node)
+        if pair is None:
+            continue
+        if expanded:
+            order.append(node)
+            continue
+        stack.append((node, True))
+        stack.append((pair[1], False))
+        stack.append((pair[0], False))
+    return order
+
+
+@dataclass(frozen=True)
+class _DPState:
+    cost: int
+    assignment: tuple[str, ...]
+
+
+def _species_path(species_tree: Tree, ancestor: str, descendant: str) -> list[str]:
+    upwards: deque[str] = deque()
+    cur = descendant
+    while cur != ancestor:
+        upwards.appendleft(cur)
+        cur = species_tree.parent[cur]
+    return [ancestor, *upwards]
+
+
+def _edge_local_loss(
+    species_tree: Tree,
+    parent_map: str,
+    child_map: str,
+    duplication: bool,
+) -> int:
+    path = _species_path(species_tree, parent_map, child_map)
+    return len(path) - 1 if duplication else len(path) - 2
+
+
+def _optimize_candidates(
+    species_tree: Tree,
+    gene_tree: Tree,
+    fixed_mapping: Mapping[str, str],
+    candidate_mapping: Mapping[str, tuple[str, ...]],
+    *,
+    duplication_weight: int,
+    loss_weight: int,
+    max_search_states: int,
+) -> tuple[dict[str, str], int, bool, int]:
+    ordered_leaves = sorted(gene_tree.leaves)
+    leaf_index = {leaf: i for i, leaf in enumerate(ordered_leaves)}
+    options: dict[str, dict[str, _DPState]] = {}
+    leaf_options: dict[str, tuple[str, ...]] = {}
+    default_assignment: tuple[str, ...] = ()
+    states_explored = 0
+    best_seen_assignment: dict[str, str] | None = None
+    best_seen_cost: int | None = None
+
+    for leaf in ordered_leaves:
+        if leaf in fixed_mapping:
+            species = fixed_mapping[leaf]
+            choices = (species,)
+            assignment = ("",) * len(ordered_leaves)
+            position = leaf_index[leaf]
+            assignment = (
+                *assignment[:position],
+                species,
+                *assignment[position + 1:],
+            )
+            options[leaf] = {species: _DPState(0, assignment)}
+        else:
+            choices = candidate_mapping[leaf]
+            table = {}
+            for species in choices:
+                assignment = ("",) * len(ordered_leaves)
+                position = leaf_index[leaf]
+                assignment = (
+                    *assignment[:position],
+                    species,
+                    *assignment[position + 1:],
+                )
+                table[species] = _DPState(0, assignment)
+            options[leaf] = table
+        leaf_options[leaf] = choices
+    default_assignment = tuple(
+        fixed_mapping[leaf] if leaf in fixed_mapping else candidate_mapping[leaf][0]
+        for leaf in ordered_leaves
+    )
+
+    complete = True
+    postorder = _gene_postorder(gene_tree)
+    for node in postorder:
+        c0, c1 = gene_tree.children[node]
+        left_states = options[c0]
+        right_states = options[c1]
+        if best_seen_assignment is None:
+            best_left = min(
+                left_states.values(),
+                key=lambda state: (state.cost, state.assignment),
+            )
+            best_right = min(
+                right_states.values(),
+                key=lambda state: (state.cost, state.assignment),
+            )
+            partial_assignment = tuple(
+                best_left.assignment[i]
+                or best_right.assignment[i]
+                or default_assignment[i]
+                for i in range(len(ordered_leaves))
+            )
+            best_seen_assignment = dict(zip(ordered_leaves, partial_assignment))
+        table: dict[str, _DPState] = {}
+        for m0, state0 in left_states.items():
+            for m1, state1 in right_states.items():
+                if states_explored >= max_search_states:
+                    complete = False
+                    break
+                states_explored += 1
+                mapped = _lca(species_tree, m0, m1)
+                duplication = m0 == mapped or m1 == mapped
+                dup_cost = duplication_weight if duplication else 0
+                loss0 = _edge_local_loss(species_tree, mapped, m0, duplication)
+                loss1 = _edge_local_loss(species_tree, mapped, m1, duplication)
+                cost = (
+                    state0.cost
+                    + state1.cost
+                    + dup_cost
+                    + loss_weight * (loss0 + loss1)
+                )
+                assignment = tuple(
+                    state0.assignment[i] or state1.assignment[i]
+                    for i in range(len(ordered_leaves))
+                )
+                if node == gene_tree.root:
+                    full_assignment = dict(zip(ordered_leaves, assignment))
+                    best_seen_tuple = None
+                    if best_seen_assignment is not None:
+                        best_seen_tuple = tuple(
+                            best_seen_assignment[leaf] for leaf in ordered_leaves
+                        )
+                    incumbent_key = (cost, assignment)
+                    incumbent_best_key = (best_seen_cost, best_seen_tuple)
+                    if best_seen_cost is None or incumbent_key < incumbent_best_key:
+                        best_seen_cost = cost
+                        best_seen_assignment = full_assignment
+                candidate_state = _DPState(cost, assignment)
+                old = table.get(mapped)
+                old_key = (old.cost, old.assignment) if old is not None else None
+                candidate_key = (candidate_state.cost, candidate_state.assignment)
+                if old_key is None or candidate_key < old_key:
+                    table[mapped] = candidate_state
+            if not complete:
+                break
+        if not complete:
+            break
+        options[node] = table
+
+    if complete:
+        root_states = options[gene_tree.root]
+        best = min(
+            root_states.values(),
+            key=lambda state: (state.cost, state.assignment),
+        )
+        assignment = dict(zip(ordered_leaves, best.assignment))
+        return assignment, best.cost, True, states_explored
+
+    fallback = best_seen_assignment or {
+        leaf: fixed_mapping.get(leaf, leaf_options[leaf][0])
+        for leaf in ordered_leaves
+    }
+    return fallback, best_seen_cost if best_seen_cost is not None else 0, False, states_explored
+
+
+def reconcile(
+    species_tree: Tree,
+    gene_tree: Tree,
+    leaf_mapping: Mapping[str, str],
+    *,
+    leaf_candidates: Mapping[str, Collection[str]] | None = None,
+    duplication_weight: int = 1,
+    loss_weight: int = 1,
+    max_nodes: int = DEFAULT_MAX_NODES,
+    max_search_states: int = DEFAULT_SEARCH_STATES,
+) -> ReconciliationResult:
+    """做固定映射 LCA 复演，或在候选物种集合中全局优化叶归属。
+
+    ``leaf_candidates`` 为 ``None`` 时保持历史单归属接口行为。候选模式中，
+    只给需要歧义处理的基因叶列出候选；其余基因叶仍由 ``leaf_mapping`` 固定。
+    优化目标为 ``duplication_weight * duplication 数 + loss_weight * loss 数``。
+    同分时选择按基因叶 ID 排序后的物种 ID 序列字典序最小的归属。
+    """
+    _check_max_nodes(max_nodes)
+
+    if not isinstance(species_tree, Tree):
+        raise InvalidInputError(
+            f"species_tree 必须为 build_tree 产出的 Tree，实际为 {type(species_tree).__name__}"
+        )
+    if not isinstance(gene_tree, Tree):
+        raise InvalidInputError(
+            f"gene_tree 必须为 build_tree 产出的 Tree，实际为 {type(gene_tree).__name__}"
+        )
+    if not isinstance(leaf_mapping, Mapping):
+        raise InvalidInputError(
+            f"leaf_mapping 必须为 Mapping，实际类型为 {type(leaf_mapping).__name__}"
+        )
+    if leaf_candidates is None:
+        result = _reconcile_fixed(
+            species_tree,
+            gene_tree,
+            leaf_mapping,
+            max_nodes=max_nodes,
+        )
+        return ReconciliationResult(
+            mapping=result.mapping,
+            events=result.events,
+            edge_losses=result.edge_losses,
+            losses_by_lineage=result.losses_by_lineage,
+            duplications=result.duplications,
+            speciations=result.speciations,
+            total_losses=result.total_losses,
+            optimal_cost=result.duplications + result.total_losses,
+            leaf_assignment=result.leaf_assignment,
+            weights=MappingProxyType({"duplication": 1, "loss": 1}),
+            complete=True,
+            states_explored=0,
+        )
+
+    duplication_weight = _check_non_negative_int(
+        duplication_weight, "duplication_weight"
+    )
+    loss_weight = _check_non_negative_int(loss_weight, "loss_weight")
+    max_search_states = _check_search_budget(max_search_states)
+    if leaf_candidates is not None and not isinstance(leaf_candidates, Mapping):
+        raise InvalidInputError(
+            "leaf_candidates 必须为 Mapping 或 None，实际类型为 "
+            f"{type(leaf_candidates).__name__}"
+        )
+
+    fixed_mapping: dict[str, str] = {}
+    for key, value in leaf_mapping.items():
+        gene_leaf = _validate_gene_leaf_key(key)
+        if gene_leaf not in gene_tree.leaves:
+            if gene_leaf in gene_tree.internal:
+                    raise LeafMappingError(
+                        "映射键必须是基因叶，不能是基因内节点", gene_leaf=gene_leaf
+                    )
+            raise LeafMappingError("不是基因树中的节点", gene_leaf=gene_leaf)
+        fixed_mapping[gene_leaf] = _validate_species_leaf(species_tree, value, gene_leaf)
+
+    candidate_mapping: dict[str, tuple[str, ...]] = {}
+    if leaf_candidates is not None:
+        for key, values in leaf_candidates.items():
+            gene_leaf = _validate_gene_leaf_key(key)
+            if gene_leaf not in gene_tree.leaves:
+                if gene_leaf in gene_tree.internal:
+                    raise LeafMappingError(
+                        "候选键必须是基因叶，不能是基因内节点", gene_leaf=gene_leaf
+                    )
+                raise LeafMappingError("不是基因树中的节点", gene_leaf=gene_leaf)
+            if gene_leaf in fixed_mapping:
+                raise LeafMappingError(
+                    "基因叶不能同时出现在 leaf_mapping 和 leaf_candidates 中",
+                    gene_leaf=gene_leaf,
+                )
+            if isinstance(values, (str, bytes)) or not isinstance(values, Collection):
+                raise LeafMappingError(
+                    "候选集合必须是非空 Collection（如 tuple/list/frozenset），不能是字符串",
+                    gene_leaf=gene_leaf,
+                )
+            if len(values) == 0:
+                raise LeafMappingError("候选集合不能为空", gene_leaf=gene_leaf)
+            deduped = {
+                _validate_species_leaf(
+                    species_tree,
+                    value,
+                    gene_leaf,
+                    target_name="候选物种",
+                ): None
+                for value in values
+            }
+            candidate_mapping[gene_leaf] = tuple(sorted(deduped))
+
+    assigned = fixed_mapping.keys() | candidate_mapping.keys()
+    missing = sorted(gene_tree.leaves - assigned)
+    if missing:
+        raise LeafMappingError(f"存在未给出归属的基因叶：{missing}", gene_leaf=missing[0])
+    extra = sorted(assigned - gene_tree.leaves)
+    if extra:
+        raise LeafMappingError(f"存在不是基因叶的归属键：{extra}", gene_leaf=extra[0])
+
+    assignment, _, complete, states_explored = _optimize_candidates(
+        species_tree,
+        gene_tree,
+        fixed_mapping,
+        candidate_mapping,
+        duplication_weight=duplication_weight,
+        loss_weight=loss_weight,
+        max_search_states=max_search_states,
+    )
+    result = _reconcile_fixed(species_tree, gene_tree, assignment, max_nodes=max_nodes)
+    weighted_cost = (
+        duplication_weight * result.duplications + loss_weight * result.total_losses
+    )
+    return ReconciliationResult(
+        mapping=result.mapping,
+        events=result.events,
+        edge_losses=result.edge_losses,
+        losses_by_lineage=result.losses_by_lineage,
+        duplications=result.duplications,
+        speciations=result.speciations,
+        total_losses=result.total_losses,
+        optimal_cost=weighted_cost,
+        leaf_assignment=dict(sorted(assignment.items())),
+        weights=MappingProxyType({"duplication": duplication_weight, "loss": loss_weight}),
+        complete=complete,
+        states_explored=states_explored,
     )

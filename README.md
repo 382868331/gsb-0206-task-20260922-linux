@@ -14,10 +14,10 @@
 ## 快速命令
 
 ```bash
-# 必要测试（26 个用例，含与独立参考的穷举交叉核对）
+# 必要测试（31 个用例，含与独立参考的穷举交叉核对及候选优化）
 python -m unittest discover -s tests -v
 
-# 固定输入演示：一个正常复演结果 + 两个实际触发的拒绝边界
+# 固定输入演示：正常复演/候选优化 + 两个实际触发的边界
 python demo.py
 ```
 
@@ -35,6 +35,22 @@ gn  = build_tree({"g1": ("a1", "b1"), "g2": ("a2", "c1"), "gr": ("g1", "g2")},
 res = reconcile(sp, gn, {"a1": "A", "b1": "B", "a2": "A", "c1": "C"})
 ```
 
+候选归属使用同一入口：
+
+```python
+res = reconcile(
+    sp,
+    gn,
+    {"a2": "A", "c1": "C"},
+    leaf_candidates={"a1": ("A", "B"), "b1": ("B", "C", "D")},
+    duplication_weight=1,
+    loss_weight=1,
+)
+res.leaf_assignment  # 优化后每个基因叶选择的物种叶
+res.optimal_cost      # duplication_weight * D + loss_weight * L
+res.complete          # False 表示搜索预算耗尽，账本仍可复验
+```
+
 ### `build_tree(children, root=None, *, name="tree", max_nodes=200) -> Tree`
 
 - `children`: `{内节点: (左子, 右子)}`，映射类型（dict）；两个子节点必须是
@@ -45,7 +61,7 @@ res = reconcile(sp, gn, {"a1": "A", "b1": "B", "a2": "A", "c1": "C"})
 - 返回不可变语义的 `Tree`（`.root/.children/.parent/.depth/.leaves/.internal/
   .leaf_descendants/.nodes`）。
 
-### `reconcile(species_tree, gene_tree, leaf_mapping, *, max_nodes=200) -> ReconciliationResult`
+### `reconcile(species_tree, gene_tree, leaf_mapping, *, leaf_candidates=None, duplication_weight=1, loss_weight=1, max_nodes=200, max_search_states=100000) -> ReconciliationResult`
 
 - `leaf_mapping`: `{基因叶: 物种叶}`，**每个基因叶恰好一条**；同一物种叶可对应
   多个基因叶（一物种多基因）。目标必须是物种**叶**，非叶映射一律拒绝。
@@ -59,6 +75,32 @@ res = reconcile(sp, gn, {"a1": "A", "b1": "B", "a2": "A", "c1": "C"})
   - `losses_by_lineage: dict[str,int]` — 每个缺失物种支系被计丢的次数；
   - `duplications / speciations / total_losses` — 累计计数。
 - 常量：`SPECIATION="speciation"`、`DUPLICATION="duplication"`。
+
+### 候选归属参数
+
+完整签名保留原位置参数，并新增仅关键字参数：
+`reconcile(..., *, leaf_candidates=None, duplication_weight=1, loss_weight=1, max_nodes=200, max_search_states=100000)`。
+
+- `leaf_candidates`: `{基因叶: [候选物种叶, ...]}`。候选必须是现有物种叶、集合非空；
+  list/tuple/frozenset 等非字符串 `Collection` 均可，重复候选自动去重。
+- 未列入 `leaf_candidates` 的基因叶仍由 `leaf_mapping` 固定；同一基因叶不能同时出现在两处。
+- 权重必须是非负 `int`，目标为 `duplication_weight * duplication 数 + loss_weight * loss 数`。
+- 树 DP 联合决定所有候选叶，不会对每个叶独立取最近物种；祖先 LCA 与事件在同一轮后序 DP 中累计。
+- 同分时，按基因叶 ID 排序后的物种 ID 序列字典序最小者胜出；权重均为 0 时也按此规则确定归属。
+- `max_search_states` 是正整数，限制 DP 枚举的子映射组合数。耗尽时 `complete=False`，结果为可行的最优已知归属之一；
+  `states_explored` 报告已检查组合数。`complete=True` 才表示已证明全局最优。
+- incomplete 结果不预存答案：返回后仍按同一 LCA 规则重新生成完整 `mapping/events/edge_losses/losses_by_lineage` 账本，
+  可用 `res.leaf_assignment` 再调用固定映射 `reconcile` 独立复算核对。
+
+新增/扩展的 `ReconciliationResult` 字段：
+
+- `leaf_assignment`: 最终采用的基因叶→物种叶归属；
+- `optimal_cost`: 本次权重下的加权目标值；
+- `weights`: 使用的 `{"duplication": ..., "loss": ...}`；
+- `complete`: 搜索是否完整；
+- `states_explored`: DP 已枚举组合数（固定映射为 0）。
+
+不传 `leaf_candidates` 或传 `None` 时走原固定映射路径，不做搜索；默认权重下原有计数、事件、丢失与账本保持不变。
 
 ## 算法规约（与题面逐条对应）
 
@@ -74,7 +116,9 @@ res = reconcile(sp, gn, {"a1": "A", "b1": "B", "a2": "A", "c1": "C"})
    speciation 时跳过**起点**处的兄弟——该支系由同一基因节点的另一个子支占据，
    不是丢失。duplication 不跳过（两个子支都从同一物种节点长出，兄弟支系无人占据）。
    枚举到的支系数与计数公式逐边 `assert` 自检一致。
-5. 复杂度：校验与复演均为线性级（LCA 按深度爬升，节点 ≤ 200）。
+5. 候选模式：每个基因子树维护“映射到各物种节点”的最小代价状态，合并两个子节点时计算 LCA、事件和两条子边丢失；
+   状态按映射物种节点归并，平分按全局叶归属序列裁决。状态预算耗尽时明确标记 incomplete。
+6. 复杂度：固定映射校验与复演均为线性级；候选 DP 为基因节点数、物种节点数和搜索预算内组合数的有界工作量（节点 ≤ 200）。
 
 ## 输入上限
 
@@ -88,17 +132,16 @@ res = reconcile(sp, gn, {"a1": "A", "b1": "B", "a2": "A", "c1": "C"})
 
 | 异常 | 触发 | 定位字段 |
 |---|---|---|
-| `InvalidInputError` | 类型/取值非法：非映射入参、标签非非空 str、`max_nodes` 为 bool/浮点/NaN/Infinity/越界等 | — |
+| `InvalidInputError` | 类型/取值非法：非映射入参、标签非非空 str、权重/预算/bool/浮点/负数/越界等 | — |
 | `TreeStructureError` | 自环、回边（循环）、多父、多根/根不可推断、根未知、不可达分量、非二叉、左右子相同 | `.tree`、`.node` |
 | `LeafMappingError` | 映射缺失/多余键、键非基因叶、目标非物种节点、**非叶映射（映到物种内节点）**、键值类型非法 | `.gene_leaf`（键本身非法时为 `None`） |
 
-- 数值输入：唯一数值参数 `max_nodes` 拒绝 `bool`（`True/False` 不当 1/0）、
-  拒绝 `float`（含 `NaN`、`+/-Infinity`，信息中区分 NaN 与 Infinity）、
-  拒绝 ≤0 与 >200。
+- 数值输入：`max_nodes` 拒绝 `bool`、`float`（含 `NaN`、`+/-Infinity`）、≤0 与 >200；
+  `duplication_weight/loss_weight` 拒绝 bool、非整数和负数；`max_search_states` 拒绝 ≤0。
 - **原子性/无状态**：库不持有任何可变状态；`reconcile` 先完成全部校验，
   再一次性构造结果，非法输入时不会产生任何部分结果或外部变更。
-- 本任务无回溯/搜索过程，不存在“搜索预算耗尽”这一结果；输入非法即确定性拒绝，
-  与“证明无解”不存在混淆面，故不设置预算类返回值。
+- 固定映射输入不存在“无解”：非法即确定性拒绝。候选模式区分“已证明最优”（`complete=True`
+  ）与“预算耗尽但有可行账本”（`complete=False`）；候选非空时总有可行归属，故不会返回无解错误。
 
 ## 浮点与误差口径
 
@@ -123,7 +166,7 @@ res = reconcile(sp, gn, {"a1": "A", "b1": "B", "a2": "A", "c1": "C"})
 
 - 仅支持有根二叉满树与 LCA（复制-丢失）复演；不支持水平基因转移、
   基因树不定根、多叉节点、分支长度、概率/成本最优搜索。
-- 叶映射必须全给定，不做“最适合映射”推断。
+- 固定映射模式要求叶映射全给定；候选模式只优化显式给出的候选集合，不自动引入额外候选。
 - 单文件模块布局（`reconciliation.py`），未打包为可安装发行版；
   使用时把该文件放入项目即可导入。
 - 左右子顺序只影响输出排列，不影响计数（镜像不变性有测试覆盖）。
@@ -133,7 +176,7 @@ res = reconcile(sp, gn, {"a1": "A", "b1": "B", "a2": "A", "c1": "C"})
 ```
 reconciliation.py        # 核心库（唯一交付模块，纯标准库）
 demo.py                  # 固定输入演示
-tests/test_reconciliation.py  # 26 个必要测试（手工硬编码 + 性质 + 边界）
+tests/test_reconciliation.py  # 31 个必要测试（手工硬编码 + 候选穷举 + 性质 + 边界）
 tests/reference.py       # 独立参考实现（不导入/不调用被测核心求期望值）
 README.md, requirements.txt
 ```

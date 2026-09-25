@@ -131,6 +131,50 @@ def main():
         print(f"    （定位字段 tree={exc.tree!r}, node={exc.node!r}）")
 
     print("\n演示结束：以上结果均由本库当场计算，未使用预录输出。")
+    print("=" * 72)
+    print("部分三：候选物种叶的全局树 DP 优化与预算边界")
+    print("=" * 72)
+
+    # 物种树 ((A,B),(C,D))；基因树 ((x,y),z)。
+    cand_species = build_tree(
+        {"u": ("A", "B"), "v": ("C", "D"), "root": ("u", "v")},
+        "root",
+        name="species",
+    )
+    cand_gene = build_tree(
+        {"p": ("x", "y"), "root": ("p", "z")},
+        "root",
+        name="gene",
+    )
+    opt = reconcile(
+        cand_species,
+        cand_gene,
+        {"z": "C"},
+        leaf_candidates={"x": ("A", "B"), "y": ("A", "B")},
+    )
+    local = reconcile(cand_species, cand_gene, {"x": "A", "y": "A", "z": "C"})
+    print("    固定 z=C；x/y 各自在 A,B 中联合选择：")
+    print(f"    最优归属={dict(opt.leaf_assignment)}；D={opt.duplications}, "
+          f"L={opt.total_losses}, cost={opt.optimal_cost}, complete={opt.complete}")
+    print(f"    若两叶都按局部最近选 A：D={local.duplications}, "
+          f"L={local.total_losses}, cost={local.duplications + local.total_losses}")
+
+    incomplete = reconcile(
+        cand_species,
+        cand_gene,
+        {"z": "C"},
+        leaf_candidates={
+            "x": ("A", "B", "C", "D"),
+            "y": ("A", "B", "C", "D"),
+        },
+        max_search_states=3,
+    )
+    replayed = reconcile(cand_species, cand_gene, incomplete.leaf_assignment)
+    print("\n    实际预算边界（max_search_states=3）：")
+    print(f"    complete={incomplete.complete}，states_explored={incomplete.states_explored}")
+    print(f"    保留可行归属={dict(incomplete.leaf_assignment)}，cost={incomplete.optimal_cost}")
+    print(f"    用该归属固定复算一致：{replayed.mapping == incomplete.mapping}，"
+          f"事件数={len(replayed.events)}")
 
 
 if __name__ == "__main__":
