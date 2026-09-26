@@ -23,6 +23,8 @@ from reconciliation import (
     TreeStructureError,
     build_tree,
     reconcile,
+    reconcile_pareto_frontier,
+    reconcile_weighted,
 )
 
 # ---------- 常用物种树 ----------
@@ -481,6 +483,205 @@ class EventPathReplayTests(unittest.TestCase):
             )
             self.assertEqual(edge.loss_count, expect_losses)
             self.assertEqual(edge.loss_count, len(edge.lost_lineages))
+
+
+class ParetoFrontierTests(unittest.TestCase):
+    def test_frontier_contains_lca_reconciliation_and_selects_weighted_optimum(self):
+        sp = build_tree(SP, "r")
+        gn = build_tree(
+            {"g1": ("a1", "b1"), "g2": ("a2", "c1"), "gr": ("g1", "g2")},
+            "gr")
+        lmap = {"a1": "A", "b1": "B", "a2": "A", "c1": "C"}
+
+        baseline = reconcile(sp, gn, lmap)
+        frontier = reconcile_pareto_frontier(sp, gn, lmap)
+
+        self.assertTrue(frontier.complete)
+        self.assertIsNone(frontier.budget_remaining)
+        self.assertEqual(
+            [(s.duplications, s.losses) for s in frontier.solutions],
+            [(baseline.duplications, baseline.total_losses)],
+        )
+        self.assertEqual(
+            frontier.solutions[0].reconciliation.mapping,
+            baseline.mapping,
+        )
+
+        weighted = reconcile_weighted(sp, gn, lmap, 3, 2)
+        self.assertEqual(weighted.optimal_cost, 7)
+        self.assertEqual(
+            [(s.duplications, s.losses) for s in weighted.solutions],
+            [(1, 2)],
+        )
+
+    def test_exhaustive_small_trees_match_dp_frontier_and_prove_single_optimum(self):
+        """独立枚举全部祖先映射；经典二叉无转移模型中前沿只有 LCA。"""
+
+        def tree_from_shape(shape, prefix):
+            counter = [0]
+            children = {}
+
+            def build(shape):
+                if isinstance(shape, int):
+                    return f"leaf{shape}"
+                left = build(shape[0])
+                right = build(shape[1])
+                node = f"{prefix}{counter[0]}"
+                counter[0] += 1
+                children[node] = (left, right)
+                return node
+
+            return children, build(shape)
+
+        def all_descendants(tree):
+            result = {leaf: {leaf} for leaf in tree.leaves}
+            for node in _postorder_children(tree.children, tree.root):
+                if node in tree.children:
+                    left, right = tree.children[node]
+                    result[node] = {node, *result[left], *result[right]}
+            return result
+
+        def ancestors_including_self(tree, node):
+            result = {node}
+            while node != tree.root:
+                node = tree.parent[node]
+                result.add(node)
+            return result
+
+        checked = 0
+        for sp_leaves in (("A", "B", "C"), ("A", "B", "C", "D")):
+            for sp_shape in all_shapes(0, len(sp_leaves)):
+                sp_children, sp_root = tree_from_shape(sp_shape, "s")
+                sp_children = {
+                    parent: tuple(
+                        sp_leaves[int(child[4:])] if child.startswith("leaf") else child
+                        for child in pair
+                    )
+                    for parent, pair in sp_children.items()
+                }
+                sp = build_tree(sp_children, sp_root)
+                descendants = all_descendants(sp)
+                for gene_leaves_count in (2, 3, 4):
+                    for gene_shape in all_shapes(0, gene_leaves_count):
+                        g_children, g_root = tree_from_shape(gene_shape, "g")
+                        gn = build_tree(g_children, g_root)
+                        internal_order = _postorder_children(g_children, g_root)
+                        gene_leaf_names = sorted(gn.leaves, key=lambda name: int(name[4:]))
+                        for labels in product(sp_leaves, repeat=gene_leaves_count):
+                            lmap = dict(zip(gene_leaf_names, labels))
+                            clade_leaves = {}
+                            for node in _postorder_children(g_children, g_root):
+                                if node in g_children:
+                                    left, right = g_children[node]
+                                    clade_leaves[node] = (
+                                        (clade_leaves.get(left) or {left})
+                                        | (clade_leaves.get(right) or {right})
+                                    )
+                            allowed = {
+                                node: set.intersection(
+                                    *(
+                                        ancestors_including_self(sp, lmap[leaf])
+                                        for leaf in clade_leaves[node]
+                                    )
+                                )
+                                for node in internal_order
+                            }
+                            brute_counts = set()
+                            for values in product(*(allowed[node] for node in internal_order)):
+                                mapping = dict(lmap)
+                                mapping.update(zip(internal_order, values))
+                                duplications = losses = 0
+                                valid = True
+                                for gene in internal_order:
+                                    mapped = mapping[gene]
+                                    left_gene, right_gene = g_children[gene]
+                                    left_map, right_map = mapping[left_gene], mapping[right_gene]
+                                    speciation = False
+                                    if mapped in sp_children:
+                                        a, b = sp_children[mapped]
+                                        speciation = (
+                                            left_map != mapped
+                                            and right_map != mapped
+                                            and (
+                                                (left_map in descendants[a] and right_map in descendants[b])
+                                                or (left_map in descendants[b] and right_map in descendants[a])
+                                            )
+                                        )
+                                    if not speciation and not (
+                                        left_map in descendants[mapped]
+                                        and right_map in descendants[mapped]
+                                    ):
+                                        valid = False
+                                        break
+                                    if not speciation:
+                                        duplications += 1
+                                    for child_map in (left_map, right_map):
+                                        edge_losses = sp.depth[child_map] - sp.depth[mapped]
+                                        if speciation:
+                                            edge_losses -= 1
+                                        losses += edge_losses
+                                if valid:
+                                    brute_counts.add((duplications, losses))
+
+                            frontier = reconcile_pareto_frontier(sp, gn, lmap)
+                            dp_counts = {(s.duplications, s.losses) for s in frontier.solutions}
+                            expected = {
+                                count
+                                for count in brute_counts
+                                if not any(
+                                    other[0] <= count[0]
+                                    and other[1] <= count[1]
+                                    and other != count
+                                    for other in brute_counts
+                                )
+                            }
+                            self.assertEqual(dp_counts, expected, (sp_children, g_children, lmap))
+                            self.assertEqual(len(dp_counts), 1, (sp_children, g_children, lmap))
+                            checked += 1
+        self.assertGreater(checked, 5000)
+
+    def test_exhausted_budget_marks_frontier_incomplete_and_weighted_refuses(self):
+        sp = build_tree(SP, "r")
+        gn = build_tree(
+            {"g1": ("a1", "b1"), "g2": ("a2", "c1"), "gr": ("g1", "g2")},
+            "gr")
+        lmap = {"a1": "A", "b1": "B", "a2": "A", "c1": "C"}
+
+        frontier = reconcile_pareto_frontier(sp, gn, lmap, budget=1)
+        self.assertFalse(frontier.complete)
+        self.assertEqual(frontier.solutions, ())
+        self.assertEqual(frontier.budget_remaining, -1)
+        with self.assertRaises(InvalidInputError):
+            reconcile_weighted(sp, gn, lmap, 1, 1, budget=1)
+
+    def test_invalid_weights_and_budget(self):
+        sp = build_tree(SP3, "r")
+        gn = build_tree({"gr": ("a", "b")}, "gr")
+        lmap = {"a": "A", "b": "B"}
+        for bad in (0, -1, True, 1.0, "1"):
+            with self.assertRaises(InvalidInputError):
+                reconcile_weighted(sp, gn, lmap, bad, 1)
+            with self.assertRaises(InvalidInputError):
+                reconcile_weighted(sp, gn, lmap, 1, bad)
+            with self.assertRaises(InvalidInputError):
+                reconcile_pareto_frontier(sp, gn, lmap, budget=bad)
+
+
+def _postorder_children(children, root):
+    result = []
+    stack = [(root, False)]
+    while stack:
+        node, expanded = stack.pop()
+        if node not in children:
+            continue
+        if expanded:
+            result.append(node)
+            continue
+        left, right = children[node]
+        stack.append((node, True))
+        stack.append((right, False))
+        stack.append((left, False))
+    return result
 
 
 if __name__ == "__main__":
