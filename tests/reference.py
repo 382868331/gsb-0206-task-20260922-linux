@@ -104,3 +104,91 @@ def reference_reconcile(sp_children, sp_root, g_children, g_root, leaf_map):
 
     total = sum(edge_loss.values())
     return mapping, events, edge_loss, edge_sibs, total
+
+
+def reference_pareto_frontier(sp_children, sp_root, g_children, g_root, leaf_map):
+    """穷举全部合法映射求 (复制数, 丢失数) Pareto 前沿（独立参考，不调用被测核心）。
+
+    合法映射：每个基因内节点映到其两个子映射的共同祖先（含自身）。
+    事件与丢失口径与核心一致：任一子映射 == 父映射 => duplication
+    （逐边路径长 d 计 d），否则 speciation（计 d-1）。
+    返回按 (D, L) 升序的非支配计数元组，以及 {计数: 规范见证映射}：
+    规范序 = 基因树后序（先左后右）节点上的物种标签序列字典序最小。
+    """
+    sp = RefTree(sp_children, sp_root)
+    gn = RefTree(g_children, g_root)
+
+    order = []
+    stack = [gn.root]
+    seen = set()
+    while stack:
+        n = stack.pop()
+        if n in gn.children:
+            if n in seen:
+                order.append(n)
+            else:
+                seen.add(n)
+                a, b = gn.children[n]
+                stack.append(n)
+                stack.append(b)
+                stack.append(a)
+
+    ancestors = {n: sp.ancestors(n) for n in sp.nodes}
+    depth = {}
+    frontier = [sp.root]
+    depth[sp.root] = 0
+    while frontier:
+        n = frontier.pop()
+        for c in sp.children.get(n, ()):
+            depth[c] = depth[n] + 1
+            frontier.append(c)
+
+    candidates = {}
+    for leaf in gn.leaves:
+        candidates[leaf] = (leaf_map[leaf],)
+    for n in order:
+        a, b = gn.children[n]
+        common = set()
+        for ma in candidates[a]:
+            for mb in candidates[b]:
+                common.update(ancestors[ma] & ancestors[mb])
+        candidates[n] = tuple(common)
+
+    keys = order
+    results = {}
+    import itertools
+
+    for vals in itertools.product(*[sorted(candidates[n]) for n in keys]):
+        mapping = dict(zip(keys, vals))
+        mapping.update(leaf_map)
+        if not all(
+            mapping[n] in ancestors[mapping[c]]
+            for n in keys
+            for c in gn.children[n]
+        ):
+            continue
+        dups = losses = 0
+        for n in keys:
+            a, b = gn.children[n]
+            s, ma, mb = mapping[n], mapping[a], mapping[b]
+            dup = ma == s or mb == s
+            da = depth[ma] - depth[s]
+            db = depth[mb] - depth[s]
+            dups += 1 if dup else 0
+            losses += (da if dup else da - 1) + (db if dup else db - 1)
+        count = (dups, losses)
+        witness = tuple(mapping[n] for n in list(order) + sorted(gn.leaves - set(order)))
+        # 规范见证键只含后序内节点序列；叶子固定，不含在比较键中。
+        key = tuple(mapping[n] for n in order)
+        if count not in results or key < results[count]:
+            results[count] = key
+
+    counts = set(results)
+    front = tuple(
+        sorted(
+            p
+            for p in counts
+            if not any(q != p and q[0] <= p[0] and q[1] <= p[1] for q in counts)
+        )
+    )
+    return front, {c: results[c] for c in front}
