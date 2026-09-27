@@ -7,12 +7,15 @@
 from __future__ import annotations
 
 from reconciliation import (
+    BUDGET_EXHAUSTED,
+    OPTIMAL_CONFIRMED,
     DUPLICATION,
     SPECIATION,
     LeafMappingError,
     TreeStructureError,
     build_tree,
     reconcile,
+    reconcile_candidates,
 )
 
 
@@ -129,6 +132,57 @@ def main():
     except TreeStructureError as exc:
         print(f"    循环树被拒绝：{type(exc).__name__}: {exc}")
         print(f"    （定位字段 tree={exc.tree!r}, node={exc.node!r}）")
+
+    print("=" * 72)
+    print("部分三：候选叶选择（最小化复制+丢失总代价，并列解稳定返回）")
+    print("=" * 72)
+
+    # 物种树: r -> (x, C), x -> (A, B)；基因树 gr -> (u, v)。
+    # u 归属未定：候选 {A, B}；v 固定为 C。
+    sp3 = build_tree({"x": ("A", "B"), "r": ("x", "C")}, "r", name="species")
+    gn3 = build_tree({"gr": ("u", "v")}, "gr", name="gene")
+    candidates = {"u": ["B", "A"], "v": "C"}  # 故意打乱候选顺序
+    print("    候选（输入顺序不影响结果排序）：", candidates)
+
+    search = reconcile_candidates(
+        sp3, gn3, candidates, duplication_weight=1, loss_weight=1
+    )
+    print(
+        f"    候选空间 {search.total_combinations} 个完整映射，"
+        f"已评估 {search.evaluated} 个，状态={search.status}（"
+        + ("已确认全局最优" if search.status == OPTIMAL_CONFIRMED else "尚未确认最优")
+        + ")"
+    )
+    print(f"    最低总代价 = {search.best_cost}"
+          f"（复制权重 {search.duplication_weight}，丢失权重 {search.loss_weight}）")
+    for sol in search.solutions:
+        chosen = ", ".join(f"{g}->{s}" for g, s in sorted(sol.leaf_mapping.items()))
+        print(
+            f"      解 [{chosen}]：复制 {sol.result.duplications}、"
+            f"丢失 {sol.result.total_losses}，"
+            f"代价拆分 复制 {sol.duplication_cost} + 丢失 {sol.loss_cost} "
+            f"= {sol.total_cost}"
+        )
+    print(
+        """
+    手工复验：u=A 时 gr=LCA(A,C)=r 为分化，边 gr->u（r->x->A, d=2）丢 1 = B 支系；
+    u=B 时同理丢 1 = A 支系。两解代价均为 1，按选定物种元组 (A,C)<(B,C)
+    稳定排列；事件判定与丢失计数完全沿用部分一的同一套 reconcile 规则。
+"""
+    )
+
+    # 额度不足的实际触发：4 个完整映射只允许评估 2 个。
+    sp2 = build_tree({"r": ("A", "B")}, "r", name="species")
+    gn2 = build_tree({"gr": ("a1", "a2")}, "gr", name="gene")
+    limited = reconcile_candidates(
+        sp2, gn2, {"a1": ["A", "B"], "a2": ["A", "B"]}, search_budget=2
+    )
+    print(
+        f"    额度演示：候选空间 {limited.total_combinations}、仅评估 "
+        f"{limited.evaluated}，状态={limited.status}；"
+        + ("已确认最优。" if limited.status == OPTIMAL_CONFIRMED
+           else "调用方应据此知晓返回解尚未确认全局最优。")
+    )
 
     print("\n演示结束：以上结果均由本库当场计算，未使用预录输出。")
 

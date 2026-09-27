@@ -4,12 +4,20 @@
 
 - build_tree(children, root=None, *, name=..., max_nodes=200) -> Tree
 - reconcile(species_tree, gene_tree, leaf_mapping, *, max_nodes=200) -> ReconciliationResult
+- reconcile_candidates(species_tree, gene_tree, leaf_candidates, *,
+      duplication_weight=1, loss_weight=1,
+      search_budget=DEFAULT_SEARCH_BUDGET, max_nodes=200) -> CandidateSearchResult
 - 数据类型: Tree / Event / LostLineage / EdgeLoss / ReconciliationResult
+    CandidateSolution / CandidateSearchResult
 - 错误类型:
     ReconciliationError
       ├─ InvalidInputError     # 类型/取值非法（含 bool 充整数、NaN/Infinity、超节点上限）
       ├─ TreeStructureError    # 树结构非法（多父、循环、不可达、非二叉等），可定位到节点
       └─ LeafMappingError      # 基因叶→物种叶映射非法（含非叶映射），可定位到基因叶
+
+候选选择（reconcile_candidates）在候选完整映射空间中穷举，每份完整映射仍调用
+reconcile（事件定义不变），按调用方给定的复制/丢失正整数权重打分，保留全部
+并列最低代价解（稳定字典序）；search_budget 耗尽时以 status 明确“尚未确认最优”。
 
 契约摘要（以 README 为准）：
 - 两棵树均为有根二叉树，节点标签为非空 str，单棵树节点数 <= max_nodes（默认 200）。
@@ -37,21 +45,34 @@ __all__ = [
     "LostLineage",
     "EdgeLoss",
     "ReconciliationResult",
+    "CandidateSolution",
+    "CandidateSearchResult",
     "build_tree",
     "reconcile",
+    "reconcile_candidates",
     "ReconciliationError",
     "InvalidInputError",
     "TreeStructureError",
     "LeafMappingError",
     "SPECIATION",
     "DUPLICATION",
+    "OPTIMAL_CONFIRMED",
+    "BUDGET_EXHAUSTED",
+    "DEFAULT_SEARCH_BUDGET",
 ]
 
 SPECIATION = "speciation"
 DUPLICATION = "duplication"
 
+# 候选完整映射搜索状态。
+OPTIMAL_CONFIRMED = "optimal_confirmed"
+BUDGET_EXHAUSTED = "budget_exhausted"
+
 # 题面给定的接口边界（单棵树节点数）。
 DEFAULT_MAX_NODES = 200
+
+# 候选选择时默认最多评估的完整映射数（搜索额度）。
+DEFAULT_SEARCH_BUDGET = 100_000
 
 
 class ReconciliationError(ValueError):
@@ -425,6 +446,58 @@ class ReconciliationResult:
     total_losses: int
 
 
+@dataclass(frozen=True)
+class CandidateSolution:
+    """候选选择下的一个完整映射解。
+
+    Attributes:
+        leaf_mapping: 完整基因叶 -> 物种叶映射（每个候选叶已选定一个物种叶）。
+        result: 该映射按仓库原有事件定义复演得到的 ``ReconciliationResult``。
+        duplication_cost: 复制代价（``duplication_weight * result.duplications``）。
+        loss_cost: 丢失代价（``loss_weight * result.total_losses``）。
+        total_cost: 总代价（复制代价 + 丢失代价）。
+    """
+
+    leaf_mapping: Mapping[str, str]
+    result: ReconciliationResult
+    duplication_cost: int
+    loss_cost: int
+    total_cost: int
+
+
+@dataclass(frozen=True)
+class CandidateSearchResult:
+    """候选选择搜索结果。
+
+    Attributes:
+        solutions: 已评估映射中总代价最低的并列解（稳定顺序，见
+            ``reconcile_candidates`` 文档）；若 ``status`` 为
+            ``budget_exhausted``，它们只是“已评估部分”的最优，尚未确认全局最优。
+        best_cost: ``solutions`` 的总代价（与各解 ``total_cost`` 一致）。
+        status: ``OPTIMAL_CONFIRMED`` 表示已枚举全部完整映射、全局最优已确认；
+            ``BUDGET_EXHAUSTED`` 表示搜索额度不足、尚未确认最优。
+        evaluated: 实际评估的完整映射数。
+        total_combinations: 候选空间中完整映射的总数（未超额时等于
+            ``evaluated``；超额时大于 ``evaluated``）。
+        search_budget: 本次使用的搜索额度（None 表示不限额度）。
+        duplication_weight / loss_weight: 本次使用的代价权重。
+    """
+
+    solutions: tuple[CandidateSolution, ...]
+    best_cost: int
+    status: str
+    evaluated: int
+    total_combinations: int
+    search_budget: int | None
+    duplication_weight: int
+    loss_weight: int
+
+    @property
+    def optimal_confirmed(self) -> bool:
+        """是否已确认全局最优（全部完整映射均已评估）。"""
+        return self.status == OPTIMAL_CONFIRMED
+
+
 def _lca(species: Tree, a: str, b: str) -> str:
     """物种树两节点的最近共同祖先（按深度抬升）。"""
     depth = species.depth
@@ -619,4 +692,236 @@ def reconcile(
         duplications=duplications,
         speciations=speciations,
         total_losses=total_losses,
+    )
+
+
+def _check_weight(value: object, name: str) -> int:
+    """代价权重校验：必须为正整数，拒绝 bool、浮点（含 NaN/Infinity）。"""
+    if isinstance(value, bool) or not isinstance(value, int):
+        if isinstance(value, float):
+            if math.isnan(value):
+                raise InvalidInputError(f"{name} 不能为 NaN")
+            if math.isinf(value):
+                raise InvalidInputError(f"{name} 不能为 Infinity/-Infinity")
+        raise InvalidInputError(
+            f"{name} 必须为正整数 int 且不能是 bool，实际类型为 {type(value).__name__}"
+        )
+    if value <= 0:
+        raise InvalidInputError(f"{name} 必须为正整数，实际为 {value}")
+    return value
+
+
+def _check_search_budget(budget: object) -> int | None:
+    """搜索额度校验：None（不限）或正整数；拒绝 bool、浮点（含 NaN/Infinity）。"""
+    if budget is None:
+        return None
+    if isinstance(budget, bool) or not isinstance(budget, int):
+        if isinstance(budget, float):
+            if math.isnan(budget):
+                raise InvalidInputError("search_budget 不能为 NaN")
+            if math.isinf(budget):
+                raise InvalidInputError("search_budget 不能为 Infinity/-Infinity")
+        raise InvalidInputError(
+            "search_budget 必须为正整数 int、None 且不能是 bool，"
+            f"实际类型为 {type(budget).__name__}"
+        )
+    if budget <= 0:
+        raise InvalidInputError(f"search_budget 必须为正整数，实际为 {budget}")
+    return budget
+
+
+def reconcile_candidates(
+    species_tree: Tree,
+    gene_tree: Tree,
+    leaf_candidates: Mapping[str, str | Sequence[str]],
+    *,
+    duplication_weight: int = 1,
+    loss_weight: int = 1,
+    search_budget: int | None = DEFAULT_SEARCH_BUDGET,
+    max_nodes: int = DEFAULT_MAX_NODES,
+) -> CandidateSearchResult:
+    """在基因叶候选物种中选择完整映射，最小化复制与丢失的总代价。
+
+    每个基因叶给出一小组候选物种叶；本函数枚举完整映射（每个候选叶选定一个
+    物种叶），对每份完整映射调用 :func:`reconcile` —— 事件分类（speciation /
+    duplication）与丢失计数完全沿用仓库原有定义，本函数不为降低代价改变任何
+    分类规则。总代价为::
+
+        duplication_weight * 复制次数 + loss_weight * 丢失次数
+
+    Args:
+        species_tree: ``build_tree`` 构造的物种树。
+        gene_tree: ``build_tree`` 构造的基因树。
+        leaf_candidates: ``{基因叶: 候选}``；候选为单个非空 ``str``（该叶归属
+            确定）或非空的字符串序列（一小组候选物种叶，按给出顺序去重前的
+            重复一律拒绝）。每个基因叶必须恰好出现一次，候选目标必须全部是
+            物种**叶**（非叶映射仍按原契约拒绝）。
+        duplication_weight: 每次复制的代价权重（正整数，默认 1）。
+        loss_weight: 每次丢失的代价权重（正整数，默认 1）。
+        search_budget: 搜索额度，即最多评估的完整映射数（正整数，默认
+            ``DEFAULT_SEARCH_BUDGET``；``None`` 表示不限额度）。枚举按
+            “基因叶标签字典序、叶内候选物种标签字典序”的稳定顺序进行；
+            额度耗尽时提前停止，返回结果 ``status`` 为 ``BUDGET_EXHAUSTED``
+            （尚未确认全局最优），否则为 ``OPTIMAL_CONFIRMED``。
+        max_nodes: 接口边界参数，语义同 :func:`reconcile`。
+
+    Returns:
+        CandidateSearchResult：并列最低代价的完整映射解（稳定顺序：代价升序后
+        按“选定物种元组（基因叶标签字典序）”字典序）、最优状态、已评估数与
+        候选空间总数。全部基因叶归属明确时候选空间恰有 1 个映射，行为与
+        直接调用 :func:`reconcile` 完全一致。
+
+    Raises:
+        InvalidInputError: 树/映射/权重/额度类型或取值非法。
+        LeafMappingError: 候选映射缺叶、多叶、键非基因叶、候选为空或重复、
+            目标不是物种叶（含非叶映射）等。
+    """
+    _check_max_nodes(max_nodes)
+    dup_w = _check_weight(duplication_weight, "duplication_weight")
+    loss_w = _check_weight(loss_weight, "loss_weight")
+    budget = _check_search_budget(search_budget)
+    if not isinstance(species_tree, Tree):
+        raise InvalidInputError(
+            f"species_tree 必须为 build_tree 产出的 Tree，实际为 {type(species_tree).__name__}"
+        )
+    if not isinstance(gene_tree, Tree):
+        raise InvalidInputError(
+            f"gene_tree 必须为 build_tree 产出的 Tree，实际为 {type(gene_tree).__name__}"
+        )
+    if not isinstance(leaf_candidates, Mapping):
+        raise InvalidInputError(
+            f"leaf_candidates 必须为 Mapping，实际类型为 {type(leaf_candidates).__name__}"
+        )
+
+    gene_leaves = gene_tree.leaves
+    sp_nodes = species_tree.nodes
+    sp_internal = species_tree.internal
+
+    # ---- 候选归一化与校验（搜索前全部完成，失败不留部分结果） ----
+    groups: dict[str, tuple[str, ...]] = {}
+    for key, raw_value in leaf_candidates.items():
+        if not isinstance(key, str) or isinstance(key, bool) or key == "":
+            raise LeafMappingError(
+                f"leaf_candidates 的键必须是非空 str，实际为 {key!r}（{type(key).__name__}）"
+            )
+        g = key
+        if g not in gene_leaves:
+            if g in gene_tree.internal:
+                raise LeafMappingError("候选键必须是基因叶，不能是基因内节点", gene_leaf=g)
+            raise LeafMappingError("不是基因树中的节点", gene_leaf=g)
+
+        if isinstance(raw_value, str) and not isinstance(raw_value, bool):
+            values: tuple[str, ...] = (raw_value,)
+        elif isinstance(raw_value, Sequence) and not isinstance(raw_value, (str, bytes)):
+            values = tuple(raw_value)
+        else:
+            raise LeafMappingError(
+                f"基因叶 {g!r} 的候选必须是非空 str 或字符串序列，"
+                f"实际类型为 {type(raw_value).__name__}",
+                gene_leaf=g,
+            )
+
+        if len(values) == 0:
+            raise LeafMappingError(f"基因叶 {g!r} 的候选不能为空", gene_leaf=g)
+        seen: set[str] = set()
+        for value in values:
+            if not isinstance(value, str) or isinstance(value, bool) or value == "":
+                raise LeafMappingError(
+                    f"基因叶 {g!r} 的候选物种必须是非空 str，实际为 {value!r}"
+                    f"（{type(value).__name__}）",
+                    gene_leaf=g,
+                )
+            if value in seen:
+                raise LeafMappingError(
+                    f"基因叶 {g!r} 的候选中存在重复物种 {value!r}", gene_leaf=g
+                )
+            seen.add(value)
+            if value not in sp_nodes:
+                raise LeafMappingError(
+                    f"候选目标 {value!r} 不是物种树中的节点", gene_leaf=g
+                )
+            if value in sp_internal:
+                raise LeafMappingError(
+                    f"候选目标 {value!r} 是物种内节点，基因叶只能映射到物种叶"
+                    "（拒绝非叶映射）",
+                    gene_leaf=g,
+                )
+        groups[g] = tuple(sorted(values))
+
+    missing = sorted(gene_leaves - groups.keys())
+    if missing:
+        raise LeafMappingError(f"存在未给出候选的基因叶：{missing}", gene_leaf=missing[0])
+    extra = sorted(groups.keys() - gene_leaves)
+    if extra:  # 理论上上面逐键已拦截，保留显式保护。
+        raise LeafMappingError(f"存在不属于基因叶的候选键：{extra}", gene_leaf=extra[0])
+
+    ordered_leaves = sorted(groups)
+    choice_groups = tuple(groups[g] for g in ordered_leaves)
+
+    total_combinations = 1
+    for choices in choice_groups:
+        total_combinations *= len(choices)
+
+    # ---- 稳定顺序枚举完整映射并打分（事件定义完全复用 reconcile） ----
+    best_cost: int | None = None
+    best_solutions: list[CandidateSolution] = []
+    evaluated = 0
+
+    # 显式下标进位枚举，按叶字典序 × 叶内候选字典序产生，天然稳定、可随时截断。
+    indices = [0] * len(ordered_leaves)
+    while True:
+        if budget is not None and evaluated >= budget:
+            break
+
+        chosen = tuple(choice_groups[i][indices[i]] for i in range(len(indices)))
+        full_mapping = {leaf: chosen[i] for i, leaf in enumerate(ordered_leaves)}
+        result = reconcile(species_tree, gene_tree, full_mapping, max_nodes=max_nodes)
+        d_cost = dup_w * result.duplications
+        l_cost = loss_w * result.total_losses
+        cost = d_cost + l_cost
+        if best_cost is None or cost < best_cost:
+            best_cost = cost
+            best_solutions = [
+                CandidateSolution(
+                    leaf_mapping=dict(sorted(full_mapping.items())),
+                    result=result,
+                    duplication_cost=d_cost,
+                    loss_cost=l_cost,
+                    total_cost=cost,
+                )
+            ]
+        elif cost == best_cost:
+            best_solutions.append(
+                CandidateSolution(
+                    leaf_mapping=dict(sorted(full_mapping.items())),
+                    result=result,
+                    duplication_cost=d_cost,
+                    loss_cost=l_cost,
+                    total_cost=cost,
+                )
+            )
+        evaluated += 1
+
+        # 字典序进位（最右位为最后一个叶，符合 itertools.product 顺序）。
+        k = len(indices) - 1
+        while k >= 0 and indices[k] + 1 >= len(choice_groups[k]):
+            k -= 1
+        if k < 0:
+            break
+        indices[k] += 1
+        for j in range(k + 1, len(indices)):
+            indices[j] = 0
+
+    assert best_cost is not None and best_solutions  # 至少有 1 个完整映射
+    status = OPTIMAL_CONFIRMED if evaluated == total_combinations else BUDGET_EXHAUSTED
+
+    return CandidateSearchResult(
+        solutions=tuple(best_solutions),
+        best_cost=best_cost,
+        status=status,
+        evaluated=evaluated,
+        total_combinations=total_combinations,
+        search_budget=budget,
+        duplication_weight=dup_w,
+        loss_weight=loss_w,
     )

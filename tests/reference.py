@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+from itertools import product
+
 
 class RefTree:
     def __init__(self, children, root):
@@ -104,3 +106,32 @@ def reference_reconcile(sp_children, sp_root, g_children, g_root, leaf_map):
 
     total = sum(edge_loss.values())
     return mapping, events, edge_loss, edge_sibs, total
+
+
+def reference_best_candidates(
+    sp_children, sp_root, g_children, g_root, candidates, dup_weight=1, loss_weight=1
+):
+    """独立穷举候选完整映射并打分（只依赖本参考的 reference_reconcile）。
+
+    candidates: {基因叶: (候选物种叶, ...)}。
+    返回 (最优代价, [(选定元组（按叶标签字典序）, 复制数, 丢失数), ...])，
+    并列解按选定元组字典序排列。
+    """
+    leaves = sorted(candidates)
+    best = None
+    tied = []
+    for chosen in product(*(candidates[g] for g in leaves)):
+        leaf_map = dict(zip(leaves, chosen))
+        _, events, edge_loss, _, _ = reference_reconcile(
+            sp_children, sp_root, g_children, g_root, leaf_map
+        )
+        dups = sum(1 for e in events.values() if e == "duplication")
+        losses = sum(edge_loss.values())
+        cost = dup_weight * dups + loss_weight * losses
+        if best is None or cost < best:
+            best = cost
+            tied = [(tuple(chosen), dups, losses)]
+        elif cost == best:
+            tied.append((tuple(chosen), dups, losses))
+    tied.sort(key=lambda item: item[0])
+    return best, tied

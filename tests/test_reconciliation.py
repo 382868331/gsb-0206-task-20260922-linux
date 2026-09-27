@@ -14,15 +14,19 @@ import unittest
 from itertools import product
 
 from reference import reference_reconcile
+from reference import reference_best_candidates
 
 from reconciliation import (
+    BUDGET_EXHAUSTED,
     DUPLICATION,
+    OPTIMAL_CONFIRMED,
     SPECIATION,
     InvalidInputError,
     LeafMappingError,
     TreeStructureError,
     build_tree,
     reconcile,
+    reconcile_candidates,
 )
 
 # ---------- 常用物种树 ----------
@@ -481,6 +485,196 @@ class EventPathReplayTests(unittest.TestCase):
             )
             self.assertEqual(edge.loss_count, expect_losses)
             self.assertEqual(edge.loss_count, len(edge.lost_lineages))
+
+
+class CandidateSelectionTests(unittest.TestCase):
+    """候选叶选择：手工算例、独立穷举交叉核对、并列顺序、额度、错误语义。"""
+
+    def test_hand_checked_candidate_choice(self):
+        """物种树 A,B|C；基因 (x,y)：x 候选 A/B，y=C 固定。
+
+        x=A: (A,C) 为分化，路径经根，丢 B 支系 1 次 => 代价 0D+1L=1。
+        x=B: 同理丢 A 支系 => 代价 1。两个解并列，按选定元组 (A,C)<(B,C) 排序。
+        """
+        sp = build_tree({"r": ("x", "C"), "x": ("A", "B")}, "r")
+        gn = build_tree({"gr": ("gx", "gy")}, "gr")
+        out = reconcile_candidates(
+            sp, gn, {"gx": ["B", "A"], "gy": "C"}
+        )
+        self.assertEqual(out.status, OPTIMAL_CONFIRMED)
+        self.assertEqual(out.best_cost, 1)
+        self.assertEqual(out.evaluated, 2)
+        self.assertEqual(out.total_combinations, 2)
+        chosen = [tuple(s.leaf_mapping[g] for g in sorted(s.leaf_mapping))
+                  for s in out.solutions]
+        # 输入候选顺序 [B,A] 不影响结果；按物种标签稳定排列。
+        self.assertEqual(chosen, [("A", "C"), ("B", "C")])
+        for sol in out.solutions:
+            self.assertEqual(sol.result.duplications, 0)
+            self.assertEqual(sol.result.total_losses, 1)
+            self.assertEqual((sol.duplication_cost, sol.loss_cost), (0, 1))
+
+    def test_weights_passthrough_and_zero_cost_optimum(self):
+        """权重由调用方透传；零复制零丢失映射在任何正权重下都最优。"""
+        # 物种树 (((A,B),C),D) 同 SP；基因树 ((a,b),c)，a 固定 A，b 固定 B，
+        # c 候选 C 或 D：c=C 时 (y,C) 分化无复制，边到 y 丢 0；c=D 丢更多。
+        sp = build_tree(SP, "r")
+        gn = build_tree({"gy": ("a", "b"), "gr": ("gy", "c")}, "gr")
+        candidates = {"a": "A", "b": "B", "c": ["C", "D"]}
+        out = reconcile_candidates(sp, gn, candidates)
+        self.assertEqual(out.best_cost, 0)
+        self.assertEqual([s.leaf_mapping["c"] for s in out.solutions], ["C"])
+        # 加权后各解代价仍单调：C 解为 0，D 解必为正，结论不变且权重透传。
+        out_w = reconcile_candidates(
+            sp, gn, candidates, duplication_weight=3, loss_weight=5
+        )
+        self.assertEqual(out_w.best_cost, 0)
+        self.assertEqual(out_w.duplication_weight, 3)
+        self.assertEqual(out_w.loss_weight, 5)
+
+    def test_duplication_vs_loss_tradeoff_weighted(self):
+        """构造复制/丢失取舍：不同权重选出不同最优。"""
+        # 物种树 (A,B) 根 r；基因树 gr:(a1,a2)，两叶均可映 A 或 B。
+        sp = build_tree({"r": ("A", "B")}, "r")
+        gn = build_tree({"gr": ("a1", "a2")}, "gr")
+        candidates = {"a1": ["A", "B"], "a2": ["A", "B"]}
+        # (A,B)/(B,A)：分化 0D0L，代价 0，恒最优；(A,A)/(B,B)：复制 1D0L。
+        out = reconcile_candidates(sp, gn, candidates)
+        self.assertEqual(
+            [tuple(sorted(s.leaf_mapping.items())) for s in out.solutions],
+            sorted([(("a1", "A"), ("a2", "B")),
+                    (("a1", "B"), ("a2", "A"))]),
+        )
+        for sol in out.solutions:
+            self.assertEqual(sol.result.duplications, 0)
+
+    def test_all_fixed_matches_reconcile(self):
+        """全部叶归属明确（str 候选）时，与直接 reconcile 的结果完全一致。"""
+        g = {"g1": ("a1", "b1"), "g2": ("a2", "c1"), "gr": ("g1", "g2")}
+        lmap = {"a1": "A", "b1": "B", "a2": "A", "c1": "C"}
+        sp = build_tree(SP, "r")
+        gn = build_tree(g, "gr")
+        direct = reconcile(sp, gn, lmap)
+        out = reconcile_candidates(sp, gn, lmap)
+        self.assertEqual(out.status, OPTIMAL_CONFIRMED)
+        self.assertEqual(out.total_combinations, 1)
+        self.assertEqual(len(out.solutions), 1)
+        sol = out.solutions[0]
+        self.assertEqual(sol.leaf_mapping, lmap)
+        self.assertEqual(sol.result.mapping, direct.mapping)
+        self.assertEqual(sol.result.events, direct.events)
+        self.assertEqual(sol.result.edge_losses, direct.edge_losses)
+        self.assertEqual(sol.total_cost,
+                         direct.duplications + direct.total_losses)
+
+    def test_brute_force_reference_cross_check(self):
+        """小树穷举：核心选优与独立参考（不调用核心）逐解核对代价与并列顺序。"""
+        sp_children = {"x": ("A", "B"), "r": ("x", "C")}
+        sp = build_tree(sp_children, "r")
+        g_children = {"g1": ("a", "b"), "gr": ("g1", "c")}
+        gn = build_tree(g_children, "gr")
+        candidates = {
+            "a": ["A", "B", "C"],
+            "b": ["A", "C"],
+            "c": ["B", "C"],
+        }
+        for dup_w, loss_w in ((1, 1), (1, 4), (3, 2)):
+            out = reconcile_candidates(
+                sp, gn, candidates,
+                duplication_weight=dup_w, loss_weight=loss_w,
+            )
+            ref_cost, ref_tied = reference_best_candidates(
+                sp_children, "r", g_children, "gr", candidates,
+                dup_w, loss_w,
+            )
+            self.assertEqual(out.best_cost, ref_cost)
+            self.assertEqual(len(out.solutions), len(ref_tied))
+            got = [
+                (tuple(s.leaf_mapping[leaf] for leaf in sorted(s.leaf_mapping)),
+                 s.result.duplications, s.result.total_losses)
+                for s in out.solutions
+            ]
+            self.assertEqual(got, ref_tied)
+            self.assertEqual(out.status, OPTIMAL_CONFIRMED)
+            self.assertEqual(out.evaluated,
+                             3 * 2 * 2)
+
+    def test_search_budget_exhausted(self):
+        """额度不足：只评估预算份数，状态标记尚未确认最优。"""
+        sp = build_tree({"r": ("A", "B")}, "r")
+        gn = build_tree({"gr": ("a1", "a2")}, "gr")
+        candidates = {"a1": ["A", "B"], "a2": ["A", "B"]}
+        out = reconcile_candidates(sp, gn, candidates, search_budget=2)
+        self.assertEqual(out.status, BUDGET_EXHAUSTED)
+        self.assertFalse(out.optimal_confirmed)
+        self.assertEqual(out.evaluated, 2)
+        self.assertEqual(out.total_combinations, 4)
+        # 额度 1：唯一评估的解就是当前返回解。
+        out1 = reconcile_candidates(sp, gn, candidates, search_budget=1)
+        self.assertEqual(out1.status, BUDGET_EXHAUSTED)
+        self.assertEqual(len(out1.solutions), 1)
+        # 不限额度时确认最优。
+        full = reconcile_candidates(sp, gn, candidates, search_budget=None)
+        self.assertEqual(full.status, OPTIMAL_CONFIRMED)
+        self.assertTrue(full.optimal_confirmed)
+
+    def test_budget_exactly_covers_space(self):
+        """额度恰好等于组合数时视为已确认最优。"""
+        sp = build_tree({"r": ("A", "B")}, "r")
+        gn = build_tree({"gr": ("a1", "a2")}, "gr")
+        out = reconcile_candidates(
+            sp, gn, {"a1": ["A", "B"], "a2": ["A", "B"]}, search_budget=4
+        )
+        self.assertEqual(out.status, OPTIMAL_CONFIRMED)
+
+    def test_candidate_validation_errors(self):
+        """候选输入错误全部在搜索前拒绝。"""
+        sp = build_tree({"r": ("A", "B")}, "r")
+        gn = build_tree({"gr": ("a", "b")}, "gr")
+        # 缺叶
+        with self.assertRaises(LeafMappingError):
+            reconcile_candidates(sp, gn, {"a": "A"})
+        # 多余/非基因叶键
+        with self.assertRaises(LeafMappingError):
+            reconcile_candidates(sp, gn, {"a": "A", "b": "B", "gr": "A"})
+        # 空候选
+        with self.assertRaises(LeafMappingError):
+            reconcile_candidates(sp, gn, {"a": [], "b": "B"})
+        # 候选重复
+        with self.assertRaises(LeafMappingError):
+            reconcile_candidates(sp, gn, {"a": ["A", "A"], "b": "B"})
+        # 非叶目标（映到物种内节点）
+        with self.assertRaises(LeafMappingError):
+            reconcile_candidates(sp, gn, {"a": ["A", "r"], "b": "B"})
+        # 未知物种
+        with self.assertRaises(LeafMappingError):
+            reconcile_candidates(sp, gn, {"a": ["A", "Z"], "b": "B"})
+        # 候选类型非法
+        with self.assertRaises(LeafMappingError):
+            reconcile_candidates(sp, gn, {"a": 3, "b": "B"})
+        # 权重非法
+        with self.assertRaises(InvalidInputError):
+            reconcile_candidates(sp, gn, {"a": "A", "b": "B"},
+                                 duplication_weight=0)
+        with self.assertRaises(InvalidInputError):
+            reconcile_candidates(sp, gn, {"a": "A", "b": "B"},
+                                 loss_weight=True)
+        with self.assertRaises(InvalidInputError):
+            reconcile_candidates(sp, gn, {"a": "A", "b": "B"},
+                                 loss_weight=float("nan"))
+        # 额度非法
+        with self.assertRaises(InvalidInputError):
+            reconcile_candidates(sp, gn, {"a": "A", "b": "B"},
+                                 search_budget=0)
+        with self.assertRaises(InvalidInputError):
+            reconcile_candidates(sp, gn, {"a": "A", "b": "B"},
+                                 search_budget=1.5)
+        # 非 Mapping 入参
+        with self.assertRaises(InvalidInputError):
+            reconcile_candidates(sp, gn, [("a", "A"), ("b", "B")])
+        # 错树类型
+        with self.assertRaises(InvalidInputError):
+            reconcile_candidates(sp, object(), {"a": "A", "b": "B"})
 
 
 if __name__ == "__main__":
