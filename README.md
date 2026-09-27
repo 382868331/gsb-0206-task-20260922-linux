@@ -4,6 +4,11 @@
 基因叶→物种叶映射，输出 LCA 映射、事件表（speciation / duplication）、
 逐基因父子边的丢失计数与**具体缺失支系**。
 
+新增**候选选择**：某些基因叶不能确定对应哪个物种时，可给一小组候选物种叶，
+由库枚举全部完整映射（仍用仓库原来的事件定义，不改变分类规则），
+按调用方提供的复制/丢失代价权重找出总代价最低的完整映射；并列最优按稳定
+顺序全部返回，搜索额度不足时明确标注“尚未确认最优”。
+
 ## 运行环境
 
 - Python **3.14.7**（开发与验证版本；仅用标准库，`from __future__ import annotations`，
@@ -14,10 +19,10 @@
 ## 快速命令
 
 ```bash
-# 必要测试（26 个用例，含与独立参考的穷举交叉核对）
+# 必要测试（36 个用例，含与独立参考的穷举交叉核对、候选选择穷举核对）
 python -m unittest discover -s tests -v
 
-# 固定输入演示：一个正常复演结果 + 两个实际触发的拒绝边界
+# 固定输入演示：正常复演、候选选择 + 三个实际触发的拒绝边界
 python demo.py
 ```
 
@@ -34,6 +39,50 @@ gn  = build_tree({"g1": ("a1", "b1"), "g2": ("a2", "c1"), "gr": ("g1", "g2")},
                  "gr", name="gene")
 res = reconcile(sp, gn, {"a1": "A", "b1": "B", "a2": "A", "c1": "C"})
 ```
+
+### 候选选择：reconcile_best（不确定叶的完整映射）
+
+```python
+from reconciliation import reconcile_best
+
+# b1/c1 归属不确定，各给一小组候选；a1/a2 归属明确（单值 str）。
+sel = reconcile_best(
+    sp, gn,
+    {"a1": "A", "a2": "A", "b1": ["B", "D"], "c1": ["C", "D"]},
+    duplication_cost=2, loss_cost=1,
+)
+print(sel.optimal, sel.best[0].leaf_assignment)
+```
+
+签名：
+
+```python
+reconcile_best(species_tree, gene_tree, leaf_candidates, *,
+               duplication_cost=1, loss_cost=1, max_evaluations=10000,
+               max_nodes=200) -> CandidateSelectionResult
+```
+
+- leaf_candidates: {基因叶: 物种叶 | 物种叶序列}，每个基因叶恰好一条；
+  单值 str 表示归属明确，序列表示一小组候选（必须去重、保序，候选目标必须是
+  物种叶，依旧拒绝非叶映射）。全部给单值即原“叶子归属全部明确”的用法，
+  结果恰有一个完整映射，与直接调用 reconcile 等价。
+- duplication_cost / loss_cost: 复制与丢失的代价权重，由调用方提供；
+  正的 int 或有限 float（拒绝 bool、NaN、Infinity、<=0）。
+  总代价 = duplications * duplication_cost + total_losses * loss_cost。
+- max_evaluations: 最多评估多少个完整映射（每次枚举 = 一次完整复演），
+  正整数，默认 10000；候选空间超过预算时按稳定顺序截断。
+- CandidateSelectionResult 字段：
+  - best: tuple[CandidateMapping, ...] — 并列最优完整映射全部返回，
+    按“基因叶标签升序后比较选中物种叶”的稳定顺序排列；
+  - optimal: bool — False 表示预算耗尽、**尚未确认全局最优**，
+    best 仅为已评估部分中的最优；True 表示已穷举、确认全局最优；
+  - best_cost / evaluated / total_combinations / duplication_cost / loss_cost。
+- CandidateMapping 字段：leaf_assignment（完整叶映射）、result
+  （按原定义复演的 ReconciliationResult）、cost（该映射加权代价）。
+- 事件定义不变：每个完整映射与 reconcile 共用同一条复演计算路径，
+  候选选择不会、也无法为降低代价改变 duplication/speciation 分类与丢失计数。
+- 枚举顺序确定：基因叶按标签升序，每叶候选按入参顺序；并列再按完整
+  叶赋值排序，结果可 diff、可复现。
 
 ### `build_tree(children, root=None, *, name="tree", max_nodes=200) -> Tree`
 

@@ -13,6 +13,7 @@ from reconciliation import (
     TreeStructureError,
     build_tree,
     reconcile,
+    reconcile_best,
 )
 
 
@@ -131,6 +132,56 @@ def main():
         print(f"    （定位字段 tree={exc.tree!r}, node={exc.node!r}）")
 
     print("\n演示结束：以上结果均由本库当场计算，未使用预录输出。")
+
+    print("=" * 72)
+    print("部分三：候选选择（不确定叶在候选中选复制+丢失代价最低的完整映射）")
+    print("=" * 72)
+
+    # 复用部分一的两棵树；叶 b1/c1 归属不确定，各给一小组候选。
+    #   a1 确定 -> A；b1 候选 [B,D]；c1 候选 [C,D]，共 2*2=4 个完整映射。
+    candidates = {"a1": "A", "a2": "A", "b1": ["B", "D"], "c1": ["C", "D"]}
+    print("基因叶候选（单值表示归属明确）：")
+    for g, choices in sorted(candidates.items()):
+        shown = choices if isinstance(choices, (list, tuple)) else [choices]
+        print(f"    {g} -> {list(shown)}")
+
+    sel = reconcile_best(sp, gn, candidates,
+                         duplication_cost=2, loss_cost=1)
+    print(f"\n权重：复制代价={sel.duplication_cost}, 丢失代价={sel.loss_cost}")
+    print(f"完整映射总数={sel.total_combinations}，实际评估={sel.evaluated}，"
+          f"已确认全局最优={sel.optimal}")
+    print(f"并列最优 {len(sel.best)} 个（稳定顺序），最优加权代价={sel.best_cost}：")
+    for i, cm in enumerate(sel.best, 1):
+        print(f"  [{i}] 叶映射={dict(cm.leaf_assignment)} "
+              f"复制={cm.result.duplications}, 丢失={cm.result.total_losses}, "
+              f"代价={cm.cost:g}")
+
+    # 权重由调用方提供：复制极便宜时，偏好“种内复制”解可改变最优选择。
+    sel2 = reconcile_best(sp, gn, candidates,
+                          duplication_cost=1, loss_cost=10)
+    print("\n把丢失代价调高到 10（复制代价 1）后：")
+    print(f"    最优叶映射={dict(sel2.best[0].leaf_assignment)}，"
+          f"复制={sel2.best[0].result.duplications}，"
+          f"丢失={sel2.best[0].result.total_losses}，代价={sel2.best_cost:g}")
+
+    # 搜索额度不足：4 个组合只给 2 次预算 => 明确标注尚未确认最优。
+    sel3 = reconcile_best(sp, gn, candidates, max_evaluations=2)
+    print("\n预算不足演示（max_evaluations=2，共 4 个完整映射）：")
+    print(f"    已确认全局最优={sel3.optimal}，已评估={sel3.evaluated}/"
+          f"{sel3.total_combinations}")
+    print("    （optimal=False：并列结果仅为已评估部分中的最优，"
+          "尚未确认全局最优）")
+    print(f"    预算内最优={dict(sel3.best[0].leaf_assignment)}")
+
+    # 候选非法实际触发的拒绝边界：候选映到物种内节点（非叶映射依旧拒绝）。
+    try:
+        reconcile_best(
+            sp, gn,
+            {"a1": "A", "a2": "A", "b1": ["B", "x"], "c1": "C"},
+        )
+    except LeafMappingError as exc:
+        print(f"\n候选非叶映射被拒绝：{type(exc).__name__}: {exc}")
+        print(f"    （定位字段 gene_leaf={exc.gene_leaf!r}）")
 
 
 if __name__ == "__main__":

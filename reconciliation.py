@@ -4,7 +4,11 @@
 
 - build_tree(children, root=None, *, name=..., max_nodes=200) -> Tree
 - reconcile(species_tree, gene_tree, leaf_mapping, *, max_nodes=200) -> ReconciliationResult
+- reconcile_best(species_tree, gene_tree, leaf_candidates, *,
+                 duplication_cost=1, loss_cost=1, max_evaluations=10000,
+                 max_nodes=200) -> CandidateSelectionResult
 - 数据类型: Tree / Event / LostLineage / EdgeLoss / ReconciliationResult
+            CandidateMapping / CandidateSelectionResult
 - 错误类型:
     ReconciliationError
       ├─ InvalidInputError     # 类型/取值非法（含 bool 充整数、NaN/Infinity、超节点上限）
@@ -22,11 +26,18 @@
 
 本模块为纯函数式、无状态：结果全部在校验通过后一次性构造，
 非法输入在任何结果产生前抛错，不存在部分变更。
+
+候选选择（reconcile_best）：部分基因叶只给一小组候选物种叶时，枚举其完整
+映射，对每个完整映射照旧（不改变任何事件定义）做一次 LCA 复演，取
+代价 = 复制数*duplication_cost + 丢失数*loss_cost 最小者；并列最优按稳定
+顺序全部返回；枚举受 max_evaluations 预算限制，额度不足时结果显式标注
+“尚未确认全局最优”。叶子归属全部明确（每个候选集仅一个元素）的用法照旧可用。
 """
 
 from __future__ import annotations
 
 import math
+from itertools import product
 from collections import deque
 from dataclasses import dataclass
 from typing import Mapping, Sequence
@@ -39,6 +50,9 @@ __all__ = [
     "ReconciliationResult",
     "build_tree",
     "reconcile",
+    "reconcile_best",
+    "CandidateMapping",
+    "CandidateSelectionResult",
     "ReconciliationError",
     "InvalidInputError",
     "TreeStructureError",
@@ -52,6 +66,8 @@ DUPLICATION = "duplication"
 
 # 题面给定的接口边界（单棵树节点数）。
 DEFAULT_MAX_NODES = 200
+# 候选完整映射枚举次数的默认预算（每次枚举 = 一次与 reconcile 同定义的完整复演）。
+DEFAULT_MAX_EVALUATIONS = 10_000
 
 
 class ReconciliationError(ValueError):
@@ -439,6 +455,69 @@ def _lca(species: Tree, a: str, b: str) -> str:
     return a
 
 
+def _check_trees(species_tree: object, gene_tree: object) -> None:
+    """校验两棵树均为本库 :class:`Tree`。"""
+    if not isinstance(species_tree, Tree):
+        raise InvalidInputError(
+            f"species_tree 必须为 build_tree 产出的 Tree，实际为 {type(species_tree).__name__}"
+        )
+    if not isinstance(gene_tree, Tree):
+        raise InvalidInputError(
+            f"gene_tree 必须为 build_tree 产出的 Tree，实际为 {type(gene_tree).__name__}"
+        )
+
+
+def _check_leaf_target(species_tree: Tree, gene_tree: Tree, g: str, s: str) -> None:
+    """校验单条 基因叶 g -> 物种叶 s 合法（拒绝非叶映射等）。"""
+    if g not in gene_tree.leaves:
+        if g in gene_tree.internal:
+            raise LeafMappingError(
+                "映射键必须是基因叶，不能是基因内节点", gene_leaf=g
+            )
+        raise LeafMappingError("不是基因树中的节点", gene_leaf=g)
+    if s not in species_tree.nodes:
+        raise LeafMappingError(
+            f"映射目标 {s!r} 不是物种树中的节点", gene_leaf=g
+        )
+    if s in species_tree.internal:
+        # 题面硬性要求：拒绝非叶映射。
+        raise LeafMappingError(
+            f"映射目标 {s!r} 是物种内节点，基因叶只能映射到物种叶（拒绝非叶映射）",
+            gene_leaf=g,
+        )
+
+
+def _resolve_leaf_mapping(
+    species_tree: Tree, gene_tree: Tree, leaf_mapping: Mapping[str, str]
+) -> dict[str, str]:
+    """把入参 leaf_mapping 完整校验为 {基因叶: 物种叶}（缺失键在此后另查）。"""
+    if not isinstance(leaf_mapping, Mapping):
+        raise InvalidInputError(
+            f"leaf_mapping 必须为 Mapping，实际类型为 {type(leaf_mapping).__name__}"
+        )
+    raw_mapping: dict[str, str] = {}
+    for key, value in leaf_mapping.items():
+        # 键本身不是合法标签时无法定位到具体基因叶，gene_leaf=None。
+        if not isinstance(key, str) or isinstance(key, bool) or key == "":
+            raise LeafMappingError(
+                f"leaf_mapping 的键必须是非空 str，实际为 {key!r}（{type(key).__name__}）"
+            )
+        if not isinstance(value, str) or isinstance(value, bool) or value == "":
+            raise LeafMappingError(
+                f"基因叶 {key!r} 的映射目标必须是非空 str，实际为 {value!r}"
+                f"（{type(value).__name__}）",
+                gene_leaf=key,
+            )
+        _check_leaf_target(species_tree, gene_tree, key, value)
+        raw_mapping[key] = value
+    missing = sorted(gene_tree.leaves - raw_mapping.keys())
+    if missing:
+        raise LeafMappingError(
+            f"存在未给出映射的基因叶：{missing}", gene_leaf=missing[0]
+        )
+    return raw_mapping
+
+
 def reconcile(
     species_tree: Tree,
     gene_tree: Tree,
@@ -463,57 +542,25 @@ def reconcile(
         LeafMappingError: 映射不完整、含未知键、目标不是物种叶（非叶映射）等。
     """
     _check_max_nodes(max_nodes)  # 显式拒绝 bool/NaN 等
-    if not isinstance(species_tree, Tree):
-        raise InvalidInputError(
-            f"species_tree 必须为 build_tree 产出的 Tree，实际为 {type(species_tree).__name__}"
-        )
-    if not isinstance(gene_tree, Tree):
-        raise InvalidInputError(
-            f"gene_tree 必须为 build_tree 产出的 Tree，实际为 {type(gene_tree).__name__}"
-        )
-    if not isinstance(leaf_mapping, Mapping):
-        raise InvalidInputError(
-            f"leaf_mapping 必须为 Mapping，实际类型为 {type(leaf_mapping).__name__}"
-        )
+    _check_trees(species_tree, gene_tree)
 
     # ---- 映射校验（全部在任何计算之前完成） ----
-    gene_leaves = gene_tree.leaves
-    raw_mapping: dict[str, str] = {}
-    for key, value in leaf_mapping.items():
-        # 键本身不是合法标签时无法定位到具体基因叶，gene_leaf=None。
-        if not isinstance(key, str) or isinstance(key, bool) or key == "":
-            raise LeafMappingError(
-                f"leaf_mapping 的键必须是非空 str，实际为 {key!r}（{type(key).__name__}）"
-            )
-        g = key
-        if not isinstance(value, str) or isinstance(value, bool) or value == "":
-            raise LeafMappingError(
-                f"基因叶 {g!r} 的映射目标必须是非空 str，实际为 {value!r}"
-                f"（{type(value).__name__}）",
-                gene_leaf=g,
-            )
-        s = value
-        if g not in gene_leaves:
-            if g in gene_tree.internal:
-                raise LeafMappingError(
-                    "映射键必须是基因叶，不能是基因内节点", gene_leaf=g
-                )
-            raise LeafMappingError("不是基因树中的节点", gene_leaf=g)
-        if s not in species_tree.nodes:
-            raise LeafMappingError(
-                f"映射目标 {s!r} 不是物种树中的节点", gene_leaf=g
-            )
-        if s in species_tree.internal:
-            # 题面硬性要求：拒绝非叶映射。
-            raise LeafMappingError(
-                f"映射目标 {s!r} 是物种内节点，基因叶只能映射到物种叶（拒绝非叶映射）",
-                gene_leaf=g,
-            )
-        raw_mapping[g] = s
+    raw_mapping = _resolve_leaf_mapping(species_tree, gene_tree, leaf_mapping)
 
-    missing = sorted(gene_leaves - raw_mapping.keys())
-    if missing:
-        raise LeafMappingError(f"存在未给出映射的基因叶：{missing}", gene_leaf=missing[0])
+    return _reconcile_resolved(species_tree, gene_tree, raw_mapping)
+
+
+def _reconcile_resolved(
+    species_tree: Tree,
+    gene_tree: Tree,
+    raw_mapping: Mapping[str, str],
+) -> ReconciliationResult:
+    """对已经过全部校验的 {基因叶: 物种叶} 映射执行 LCA 复演。
+
+    ``reconcile`` 与候选搜索 ``reconcile_best`` 共用这一条计算路径，
+    从而保证“每种完整映射仍使用仓库原来的事件定义”，候选选择不会、
+    也无法为降低代价改变任何分类规则。
+    """
 
     # ---- 后序求 LCA 映射 ----
     g_children = gene_tree.children
@@ -619,4 +666,234 @@ def reconcile(
         duplications=duplications,
         speciations=speciations,
         total_losses=total_losses,
+    )
+
+
+@dataclass(frozen=True)
+class CandidateMapping:
+    """一个并列最优（或预算内最优）的完整候选映射。
+
+    Attributes:
+        leaf_assignment: 全部基因叶 -> 选定物种叶的完整映射（稳定排序）。
+        result: 该完整映射按仓库原定义复演得到的 ReconciliationResult。
+        cost: 加权代价 duplications*duplication_cost + total_losses*loss_cost。
+    """
+
+    leaf_assignment: Mapping[str, str]
+    result: ReconciliationResult
+    cost: float
+
+
+@dataclass(frozen=True)
+class CandidateSelectionResult:
+    """候选选择搜索结果（不可变）。
+
+    Attributes:
+        best: 全部并列最优完整映射，按 leaf_assignment 的稳定顺序排列
+            （基因叶标签升序后比较各自选中的物种叶）。
+        optimal: True 表示全部完整映射均已评估、已确认全局最优；
+            False 表示搜索预算（max_evaluations）耗尽、尚未确认全局最优，
+            best 仅为已评估部分中的最优。
+        best_cost: 最优代价（与 best[0].cost 一致）。
+        evaluated: 实际评估的完整映射个数（每个都是一次完整复演）。
+        total_combinations: 候选空间的完整映射总数（可能远大于 evaluated）。
+        duplication_cost / loss_cost: 本次搜索使用的权重。
+    """
+
+    best: tuple[CandidateMapping, ...]
+    optimal: bool
+    best_cost: float
+    evaluated: int
+    total_combinations: int
+    duplication_cost: float
+    loss_cost: float
+
+
+def _check_weight(value: object, name: str) -> float:
+    """校验代价权重：int 或有限 float，拒绝 bool、NaN、Infinity 与非正数。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise InvalidInputError(
+            f"{name} 必须为 int 或有限 float，且不能是 bool，实际类型为 "
+            f"{type(value).__name__}"
+        )
+    fv = float(value)
+    if math.isnan(fv):
+        raise InvalidInputError(f"{name} 不能为 NaN")
+    if math.isinf(fv):
+        raise InvalidInputError(f"{name} 不能为 Infinity/-Infinity")
+    if fv <= 0:
+        raise InvalidInputError(f"{name} 必须为正数，实际为 {value!r}")
+    return fv
+
+
+def _check_evaluations(value: object) -> int:
+    """校验搜索预算：正整数，拒绝 bool、float、NaN/Infinity 与非正值。"""
+    if isinstance(value, bool) or not isinstance(value, int):
+        if isinstance(value, float):
+            if math.isnan(value):
+                raise InvalidInputError("max_evaluations 不能为 NaN")
+            if math.isinf(value):
+                raise InvalidInputError("max_evaluations 不能为 Infinity/-Infinity")
+        raise InvalidInputError(
+            "max_evaluations 必须为 int 且不能是 bool，实际类型为 "
+            f"{type(value).__name__}"
+        )
+    if value < 1:
+        raise InvalidInputError(f"max_evaluations 必须为正整数，实际为 {value}")
+    return value
+
+
+def _resolve_leaf_candidates(
+    species_tree: Tree,
+    gene_tree: Tree,
+    leaf_candidates: Mapping[str, str | Sequence[str]],
+) -> dict[str, tuple[str, ...]]:
+    """把候选入参校验为 {基因叶: 去重后非空候选物种叶元组}。
+
+    每个基因叶必须恰好出现一次；候选可传单值 str（归属明确）或非空字符串
+    序列（一小组候选）；候选目标必须是物种叶（拒绝非叶映射），候选必须去重
+    并保持调用方给定的先后顺序（枚举时的稳定顺序）。
+    """
+    if not isinstance(leaf_candidates, Mapping):
+        raise InvalidInputError(
+            "leaf_candidates 必须为 Mapping，实际类型为 "
+            f"{type(leaf_candidates).__name__}"
+        )
+
+    resolved: dict[str, tuple[str, ...]] = {}
+    for key, raw in leaf_candidates.items():
+        if not isinstance(key, str) or isinstance(key, bool) or key == "":
+            raise LeafMappingError(
+                "leaf_candidates 的键必须是非空 str，实际为 "
+                f"{key!r}（{type(key).__name__}）"
+            )
+        g = key
+        if isinstance(raw, str) and not isinstance(raw, bool):
+            choices: tuple[str, ...] = (raw,)
+        elif isinstance(raw, Sequence) and not isinstance(raw, (bytes, bytearray)):
+            picked: list[str] = []
+            seen: set[str] = set()
+            for item in raw:
+                if not isinstance(item, str) or isinstance(item, bool) or item == "":
+                    raise LeafMappingError(
+                        f"基因叶 {g!r} 的候选必须全部是非空 str，实际含 {item!r}"
+                        f"（{type(item).__name__}）",
+                        gene_leaf=g,
+                    )
+                if item in seen:
+                    raise LeafMappingError(
+                        f"基因叶 {g!r} 的候选存在重复物种叶 {item!r}，请去重后传入",
+                        gene_leaf=g,
+                    )
+                seen.add(item)
+                picked.append(item)
+            if not picked:
+                raise LeafMappingError(
+                    f"基因叶 {g!r} 的候选序列不能为空", gene_leaf=g
+                )
+            choices = tuple(picked)
+        else:
+            raise LeafMappingError(
+                f"基因叶 {g!r} 的候选必须是非空 str 或非空字符串序列，实际类型为 "
+                f"{type(raw).__name__}",
+                gene_leaf=g,
+            )
+        for s in choices:
+            _check_leaf_target(species_tree, gene_tree, g, s)
+        resolved[g] = choices
+
+    missing = sorted(gene_tree.leaves - resolved.keys())
+    if missing:
+        raise LeafMappingError(
+            f"存在未给出候选的基因叶：{missing}", gene_leaf=missing[0]
+        )
+    return resolved
+
+
+def reconcile_best(
+    species_tree: Tree,
+    gene_tree: Tree,
+    leaf_candidates: Mapping[str, str | Sequence[str]],
+    *,
+    duplication_cost: float = 1,
+    loss_cost: float = 1,
+    max_evaluations: int = DEFAULT_MAX_EVALUATIONS,
+    max_nodes: int = DEFAULT_MAX_NODES,
+) -> CandidateSelectionResult:
+    """在基因叶候选中选择使复制+丢失加权代价最低的完整映射。
+
+    事件定义与 reconcile 完全一致：每个候选完整映射都通过同一条 LCA 复演
+    路径计算（内部共用 _reconcile_resolved），分类规则不会因搜索而改变。
+    代价 = duplications*duplication_cost + total_losses*loss_cost。
+
+    Args:
+        species_tree / gene_tree: build_tree 构造的两棵树。
+        leaf_candidates: {基因叶: 物种叶 | 物种叶序列}；单值 str 表示归属
+            明确，序列表示一小组候选（必须去重、保序）。必须覆盖全部基因叶。
+        duplication_cost / loss_cost: 复制与丢失的代价权重，正的 int 或有限
+            float（拒绝 bool、NaN、Infinity、<=0），由调用方提供。
+        max_evaluations: 最多评估多少个完整映射（每次评估即一次完整复演）；
+            正整数。枚举按稳定顺序进行（基因叶标签升序、候选按入参顺序）。
+        max_nodes: 接口边界参数（与 reconcile 一致，先校验参数本身）。
+
+    Returns:
+        CandidateSelectionResult：并列最优全部返回（稳定顺序）；
+        optimal=False 表示预算耗尽、尚未确认全局最优。
+
+    Raises:
+        InvalidInputError: 树/权重/预算等参数类型或取值非法。
+        LeafMappingError: 候选缺失、键非基因叶、目标非物种叶、候选重复/为空等。
+    """
+    _check_max_nodes(max_nodes)
+    _check_trees(species_tree, gene_tree)
+    w_dup = _check_weight(duplication_cost, "duplication_cost")
+    w_loss = _check_weight(loss_cost, "loss_cost")
+    budget = _check_evaluations(max_evaluations)
+
+    resolved = _resolve_leaf_candidates(species_tree, gene_tree, leaf_candidates)
+    # 稳定枚举顺序：基因叶按标签升序；每个叶的候选按调用方给定顺序。
+    ordered_leaves = sorted(resolved)
+    choice_tuples = [resolved[g] for g in ordered_leaves]
+
+    total_combinations = 1
+    for choices in choice_tuples:
+        total_combinations *= len(choices)
+
+    best: list[CandidateMapping] = []
+    best_cost: float | None = None
+    evaluated = 0
+    optimal = True
+
+    for picked in product(*choice_tuples):
+        assignment = {g: s for g, s in zip(ordered_leaves, picked)}
+        result = _reconcile_resolved(species_tree, gene_tree, assignment)
+        cost = result.duplications * w_dup + result.total_losses * w_loss
+        evaluated += 1
+        candidate = CandidateMapping(
+            leaf_assignment=dict(sorted(assignment.items())),
+            result=result,
+            cost=cost,
+        )
+        if best_cost is None or cost < best_cost:
+            best_cost = cost
+            best = [candidate]
+        elif cost == best_cost:
+            best.append(candidate)
+        if evaluated >= budget and evaluated < total_combinations:
+            optimal = False
+            break
+
+    # 显式按完整叶赋值（基因叶升序后的物种叶元组）排序，给出可 diff、
+    # 与候选入参顺序解耦的稳定并列次序。
+    best.sort(key=lambda cm: tuple(cm.leaf_assignment[g] for g in ordered_leaves))
+
+    assert best_cost is not None and best  # 每个基因叶至少一个候选，空间非空
+    return CandidateSelectionResult(
+        best=tuple(best),
+        optimal=optimal,
+        best_cost=best_cost,
+        evaluated=evaluated,
+        total_combinations=total_combinations,
+        duplication_cost=w_dup,
+        loss_cost=w_loss,
     )
